@@ -1,0 +1,10 @@
+# build / download artefacts
+*.tar.gz
+*.zip
+# editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.directory
+.DS_Store

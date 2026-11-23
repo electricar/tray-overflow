@@ -1,0 +1,79 @@
+{
+    "head-behaviour": {
+        "type": "header",
+        "description": "Behaviour"
+    },
+    "hide-new-icons": {
+        "type": "switch",
+        "default": false,
+        "description": "Send new tray icons to the overflow automatically (like Windows 11)",
+        "tooltip": "When on, every icon you haven't decided about yet goes into the ^ popup. Pin the ones you want in the panel."
+    },
+    "head-attention": {
+        "type": "header",
+        "description": "Icons that come back when they change"
+    },
+    "attention-delay-in": {
+        "type": "spinbutton",
+        "default": 0.5,
+        "min": 0,
+        "max": 30,
+        "step": 0.5,
+        "units": "seconds",
+        "description": "Wait before moving an icon into the panel",
+        "tooltip": "The new look must stay this long. 0 = immediately."
+    },
+    "attention-delay-out": {
+        "type": "spinbutton",
+        "default": 3,
+        "min": 0,
+        "max": 60,
+        "step": 0.5,
+        "units": "seconds",
+        "description": "Wait before moving it back to the overflow",
+        "tooltip": "Prevents flickering when an app briefly shows its normal icon in between."
+    },
+    "head-look": {
+        "type": "header",
+        "description": "Overflow popup"
+    },
+    "columns": {
+        "type": "spinbutton",
+        "default": 5,
+        "min": 1,
+        "max": 12,
+        "step": 1,
+        "units": "icons",
+        "description": "Icons per row"
+    },
+    "overflow-icon-size": {
+        "type": "spinbutton",
+        "default": 22,
+        "min": 16,
+        "max": 48,
+        "step": 2,
+        "units": "px",
+        "description": "Icon size"
+    },
+    "head-reset": {
+        "type": "header",
+        "description": "Reset"
+    },
+    "show-all-button": {
+        "type": "button",
+        "description": "Show all icons in the panel again",
+        "callback": "on_show_all_clicked"
+    },
+    "hidden-list": {
+        "type": "generic",
+        "default": []
+    },
+    "shown-list": {
+        "type": "generic",
+        "default": []
+    },
+    "attention-rules": {
+        "type": "generic",
+        "default": {}
+    }
+}
