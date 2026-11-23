@@ -9,6 +9,63 @@
         "description": "Send new tray icons to the overflow automatically (like Windows 11)",
         "tooltip": "When on, every icon you haven't decided about yet goes into the ^ popup. Pin the ones you want in the panel."
     },
+    "head-button": {
+        "type": "header",
+        "description": "Panel button"
+    },
+    "use-custom-icon": {
+        "type": "switch",
+        "default": false,
+        "description": "Use a custom icon"
+    },
+    "button-icon": {
+        "type": "combobox",
+        "default": "arrow",
+        "description": "Icon",
+        "options": {
+            "Arrow (points to the popup)": "arrow",
+            "Three dots": "dots",
+            "Grid": "grid"
+        },
+        "dependency": "!use-custom-icon"
+    },
+    "button-custom-icon": {
+        "type": "iconfilechooser",
+        "default": "",
+        "description": "Custom icon",
+        "dependency": "use-custom-icon"
+    },
+    "show-count": {
+        "type": "switch",
+        "default": false,
+        "description": "Show the number of hidden icons next to it"
+    },
+    "open-on-hover": {
+        "type": "switch",
+        "default": false,
+        "description": "Open the popup when the mouse is over the button",
+        "tooltip": "The popup closes again when the mouse leaves it (not while an app's menu from the popup is open)."
+    },
+    "hover-delay": {
+        "type": "spinbutton",
+        "default": 300,
+        "min": 0,
+        "max": 1500,
+        "step": 50,
+        "units": "milliseconds",
+        "description": "Delay before opening",
+        "dependency": "open-on-hover"
+    },
+    "close-delay": {
+        "type": "spinbutton",
+        "default": 500,
+        "min": 100,
+        "max": 3000,
+        "step": 100,
+        "units": "milliseconds",
+        "description": "Delay before closing when the mouse leaves",
+        "dependency": "open-on-hover"
+    },
     "head-attention": {
         "type": "header",
         "description": "Icons that come back when they change"
@@ -54,6 +111,16 @@
         "step": 2,
         "units": "px",
         "description": "Icon size"
+    },
+    "head-troubleshooting": {
+        "type": "header",
+        "description": "Troubleshooting"
+    },
+    "debug-log": {
+        "type": "switch",
+        "default": false,
+        "description": "Write details to the log (Looking Glass)",
+        "tooltip": "Logs which app each tray icon belongs to and when icons move. Useful for bug reports."
     },
     "head-reset": {
         "type": "header",

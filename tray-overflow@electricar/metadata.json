@@ -1,10 +1,8 @@
 {
     "uuid": "tray-overflow@electricar",
     "name": "Tray Overflow",
-    "description": "Windows-style hidden tray icons: choose which tray icons stay in the panel and which go into a ^ overflow popup.",
-    "version": "1.12",
+    "description": "A system tray with a Windows-style ^ overflow: choose per app which tray icons stay in the panel and which go into a popup. Replaces the XApp Status Applet.",
+    "version": "2.0",
     "author": "electricar",
-    "website": "https://github.com/electricar/tray-overflow",
-    "max-instances": 1,
-    "icon": "pan-up-symbolic"
+    "max-instances": 1
 }

@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.0 — 2026-11-23
+- **Tray Overflow is now a complete tray and replaces the XApp Status Applet.** It shows the visible icons in the panel and the hidden ones in the popup, so it no longer has to work around another applet. Remove the XApp Status Applet from the panel after updating.
+- Icons only appear once it's clear which app they belong to: no flicker at login.
+- All file and D-Bus access is asynchronous.
+- Translatable texts.
+- New setting: write details to the log (off by default).
+- Compact popup: icons keep their natural size in the overflow grid.
+- The icon list shows app names from the menu ("OBS Studio", "Update Manager") instead of technical names.
+- Panel button: choose its icon (arrow, three dots, grid or any icon) and optionally show the number of hidden icons next to it (#1).
+- Option to open the popup by hovering over the button; it then closes when the mouse leaves it, both with adjustable delays (#2).
+- Removed: conversion of settings from versions before 1.12, and hiding of old-style (XEmbed) icons; those stay in the System Tray applet.
+
 ## 1.12 — 2026-11-23
 - Tray icons relayed by Mint's tray service are identified by the program behind them (or their Flatpak app id), because the service renames icons while apps run (title, tray id, connection name). No more duplicate entries.
 - Existing duplicates and leftover names of the same app are merged automatically; the entry shown in the list wins, "icon changes" rules are kept.

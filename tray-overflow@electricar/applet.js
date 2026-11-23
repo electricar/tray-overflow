@@ -2,36 +2,21 @@
 // Tray Overflow - https://github.com/electricar/tray-overflow
 // Copyright (C) 2026 electricar
 //
-// Parts (click forwarding, icon positioning, scroll handling) are based on
-// the XApp Status applet (xapp-status@cinnamon.org) from Linux Mint's
-// Cinnamon, which is licensed GPL-2.0-or-later.
-//
-// Windows-style hidden tray icons for Cinnamon.
-//
-// How it works:
-//  * Icons you mark as "hidden" are registered with Main.systrayManager as
-//    "tray icon replacements". Both stock tray applets (xapp-status and
-//    systray) already honour that list and stop showing those icons.
-//  * This applet listens to the stock xapp-status applet's icon monitor
-//    (it does NOT start a second monitor - a new monitor makes every tray
-//    app re-send its icon, which breaks some pixmap icons, e.g. Electron
-//    apps) and draws the hidden XApp/AppIndicator icons inside a ^ popup. Clicks are forwarded to the
-//    app exactly like the stock applet does.
-//  * Legacy XEmbed icons (rare: some Wine/old apps) can only be hidden
-//    completely - they can't be moved into the popup.
-//  * Optional per app: "show in panel when its icon changes". The applet
-//    remembers which icon looks are normal (stay hidden) and which are
-//    in-between states to ignore (e.g. Mint Update "checking"); any other
-//    look moves the icon into the panel until it looks normal again.
-//  * Removing this applet unregisters everything, so all icons come back.
+// A system tray for Cinnamon with a Windows-style ^ overflow: every tray icon
+// either sits in the panel or in a popup, chosen per app. It replaces the
+// stock "XApp Status Applet". The panel part (icon display, click and scroll
+// forwarding, recording indicator) is based on that applet
+// (xapp-status@cinnamon.org from Linux Mint's Cinnamon, GPL-2.0-or-later).
 
 const Applet = imports.ui.applet;
+const AppletManager = imports.ui.appletManager;
 const PopupMenu = imports.ui.popupMenu;
 const Settings = imports.ui.settings;
 const Main = imports.ui.main;
 const Tooltips = imports.ui.tooltips;
 const SignalManager = imports.misc.signalManager;
 const Mainloop = imports.mainloop;
+const Gettext = imports.gettext;
 const Cinnamon = imports.gi.Cinnamon;
 const St = imports.gi.St;
 const Clutter = imports.gi.Clutter;
@@ -40,119 +25,86 @@ const GLib = imports.gi.GLib;
 const Gtk = imports.gi.Gtk;
 const XApp = imports.gi.XApp;
 const Meta = imports.gi.Meta;
-const AppletManager = imports.ui.appletManager;
 
-const STOCK_UUID = "xapp-status@cinnamon.org";
+const UUID = "tray-overflow@electricar";
+const STOCK_TRAY_UUID = "xapp-status@cinnamon.org";
+
+Gettext.bindtextdomain(UUID, GLib.get_home_dir() + "/.local/share/locale");
+
+function _(text) {
+    return Gettext.dgettext(UUID, text);
+}
+
+function ngettext(singular, plural, n) {
+    return Gettext.dngettext(UUID, singular, plural, n);
+}
+
+const HORIZONTAL_STYLE = "padding-left: 2px; padding-right: 2px; padding-top: 0; padding-bottom: 0";
+const VERTICAL_STYLE = "padding-left: 0; padding-right: 0; padding-top: 2px; padding-bottom: 2px";
+
+const XAPP_PREFIX = "org.x.statusicon.";
+
+// Relayed tray icons start without a name; they share this id until we know
+// which app they belong to.
+const UNTITLED = "untitled";
+
+// Icons for the panel button (first one the icon theme has is used).
+const BUTTON_ICONS = {
+    dots: ["view-more-symbolic", "view-more-horizontal-symbolic", "open-menu-symbolic"],
+    grid: ["view-app-grid-symbolic", "view-grid-symbolic", "view-app-grid"]
+};
+
+// How long an icon may stay unidentified before it is shown under its name.
+const SETTLE_TIMEOUT_MS = 3000;
+
+// Programs that only run an app; the app itself is found in comm/cmdline.
+const GENERIC_EXES = ["electron", "node", "python", "python3", "java", "bash", "sh", "env", "bwrap"];
 
 // Built-in knowledge about Mint Update's tray icon states.
 const PRESETS = [
     {
-        match: name => name.startsWith("mintupdate"),
+        match: id => id.startsWith("mintupdate"),
         normal: ["icon:mintupdate-up-to-date-symbolic"],
         ignore: ["icon:mintupdate-checking-symbolic", "icon:mintupdate-installing-symbolic"]
     }
 ];
 
-/* Some tray icons (Electron apps, Mullvad, pCloud ...) have no name of their
- * own and show up under their temporary D-Bus connection (":1.1436") or a
- * PID-based name. Those change on every start, so for them we use the
- * program behind the connection instead ("app:vesktop"). */
-const GENERIC_EXES = ["electron", "node", "python", "python3", "java", "bash", "sh", "env", "bwrap"];
 
-function pidForBusName(busName) {
-    let m = busName.match(/statusnotifieritem-(\d+)-\d+$/i);
-    if (m) return parseInt(m[1]);
-    try {
-        let ret = Gio.DBus.session.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
-            "org.freedesktop.DBus", "GetConnectionUnixProcessID",
-            new GLib.Variant("(s)", [busName]), new GLib.VariantType("(u)"),
-            Gio.DBusCallFlags.NONE, 500, null);
-        return ret.deep_unpack()[0];
-    } catch (e) {
-        return 0;
-    }
+/* ------------------------------------------------------------------------
+ * Small helpers (all I/O is asynchronous)
+ * ---------------------------------------------------------------------- */
+
+function decode(bytes) {
+    if (typeof TextDecoder !== "undefined") return new TextDecoder().decode(bytes);
+    return imports.byteArray.toString(bytes);
 }
 
-function programName(pid) {
-    let base = "";
-    try {
-        base = GLib.path_get_basename(GLib.file_read_link("/proc/" + pid + "/exe")).replace(/ \(deleted\)$/, "");
-    } catch (e) { /* ignore */ }
-
-    if (!base || GENERIC_EXES.includes(base.replace(/[0-9.]+$/, ""))) {
-        try {
-            let [ok, bytes] = GLib.file_get_contents("/proc/" + pid + "/comm");
-            let comm = imports.byteArray.toString(bytes).trim();
-            if (comm) base = comm;
-        } catch (e) { /* ignore */ }
-    }
-    // Still generic (e.g. "electron", "python3")? Use the app path it runs.
-    if (!base || GENERIC_EXES.includes(base.replace(/[0-9.]+$/, ""))) {
-        try {
-            let [ok, bytes] = GLib.file_get_contents("/proc/" + pid + "/cmdline");
-            let args = imports.byteArray.toString(bytes).split("\0").slice(1).filter(a => a && !a.startsWith("-"));
-            if (args.length) {
-                let parts = args[0].split("/").filter(x => x);
-                let name = parts.pop() || "";
-                if (["app", "app.asar", "resources", "main.js", "index.js", "main.py", "__main__.py"].includes(name)) {
-                    name = parts.filter(x => x !== "resources").pop() || name;
-                }
-                name = name.replace(/\.(asar|py|jar|js)$/, "");
-                if (name) base = name;
+function readFile(path) {
+    return new Promise(resolve => {
+        Gio.File.new_for_path(path).load_contents_async(null, (file, res) => {
+            try {
+                let [ok, contents] = file.load_contents_finish(res);
+                resolve(ok ? contents : null);
+            } catch (e) {
+                resolve(null);
             }
-        } catch (e) { /* ignore */ }
-    }
-    return base.toLowerCase();
+        });
+    });
 }
 
-/* Flatpak apps talk to D-Bus through a helper (xdg-dbus-proxy), so the
- * program behind every Flatpak tray icon looks the same. The sandbox info
- * file (the same one the desktop portals use) names the real app. */
-function flatpakAppId(pid) {
-    try {
-        let kf = new GLib.KeyFile();
-        kf.load_from_file("/proc/" + pid + "/root/.flatpak-info", GLib.KeyFileFlags.NONE);
-        let name = kf.get_string("Application", "name");
-        if (name) return name;
-    } catch (e) { /* not a Flatpak, or not readable */ }
-    try {
-        let [ok, bytes] = GLib.file_get_contents("/proc/" + pid + "/cgroup");
-        let m = imports.byteArray.toString(bytes).match(/app-flatpak-([A-Za-z0-9._-]+?)-\d+\.scope/);
-        if (m) return m[1];
-    } catch (e) { /* ignore */ }
-    return null;
+function readLink(path) {
+    return new Promise(resolve => {
+        Gio.File.new_for_path(path).query_info_async("standard::symlink-target",
+            Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, GLib.PRIORITY_DEFAULT, null, (file, res) => {
+                try {
+                    resolve(file.query_info_finish(res).get_symlink_target());
+                } catch (e) {
+                    resolve(null);
+                }
+            });
+    });
 }
 
-// Ids from 1.5 that several Flatpak apps shared.
-const SHARED_IDS = ["app:xdg-dbus-proxy", "app:bwrap"];
-
-// "flatpak:dev.vencord.vesktop" or "app:cryptomator" - never changes for an app.
-function programIdForPid(pid) {
-    if (!pid) return "";
-    let fp = flatpakAppId(pid);
-    if (fp) return "flatpak:" + fp.toLowerCase();
-    let prog = programName(pid);
-    return prog ? "app:" + prog : "";
-}
-
-function stableId(rawName) {
-    let raw = rawName || "";
-    let lower = raw.toLowerCase();
-    let unstable = raw.startsWith(":") || /statusnotifieritem-\d+-\d+$/.test(lower);
-    if (!unstable) return lower;
-    return programIdForPid(pidForBusName(raw)) || lower;
-}
-
-function isProgramId(id) {
-    return id.startsWith("app:") || id.startsWith("flatpak:");
-}
-
-function unpackV(v) {
-    while (v instanceof GLib.Variant) v = v.deep_unpack();
-    return v;
-}
-
-// Asynchronous D-Bus call; resolves to the unpacked reply or null.
 function dbusCall(bus, path, iface, method, params, replyType) {
     return new Promise(resolve => {
         try {
@@ -171,94 +123,9 @@ function dbusCall(bus, path, iface, method, params, replyType) {
     });
 }
 
-function sortableName(s) {
-    return String(s).normalize("NFD").toLowerCase();
-}
-
-/* Mint's tray service (xapp-sn-watcher) names each relayed icon after the
- * app's tray title, its tray id or its connection - and switches between
- * them while the app runs. The service's list of registered apps lets us
- * map every one of those names to the program behind the icon. */
-async function buildTrayProgramMap() {
-    let map = new Map();
-    let reply = await dbusCall("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
-        "org.freedesktop.DBus.Properties", "Get",
-        new GLib.Variant("(ss)", ["org.kde.StatusNotifierWatcher", "RegisteredStatusNotifierItems"]), "(v)");
-    if (!reply) return null;
-
-    let items = unpackV(reply[0]) || [];
-    await Promise.all(items.map(async item => {
-        let i = item.indexOf("/");
-        let bus = i >= 0 ? item.substring(0, i) : item;
-        let path = i >= 0 ? item.substring(i) : "/StatusNotifierItem";
-
-        let pidReply = await dbusCall("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-            "GetConnectionUnixProcessID", new GLib.Variant("(s)", [bus]), "(u)");
-        let pid = pidReply ? pidReply[0] : 0;
-        if (!pid) {
-            let m = bus.match(/-(\d+)-\d+$/);
-            pid = m ? parseInt(m[1]) : 0;
-        }
-        let prog = programIdForPid(pid);
-        if (!prog) return;
-
-        let names = [bus];
-        for (let prop of ["Id", "Title"]) {
-            let r = await dbusCall(bus, path, "org.freedesktop.DBus.Properties", "Get",
-                new GLib.Variant("(ss)", ["org.kde.StatusNotifierItem", prop]), "(v)");
-            let v = r ? unpackV(r[0]) : null;
-            if (typeof v === "string" && v) names.push(v);
-        }
-        for (let n of names) {
-            if (!map.has(sortableName(n))) map.set(sortableName(n), prog);
-        }
-    }));
-    return map;
-}
-
-function isUnstableId(id) {
-    return id.startsWith(":") || /statusnotifieritem-\d+-\d+$/.test(id);
-}
-
-/* A stable fingerprint of what the icon currently looks like. Pixmap icons
- * (Electron apps such as Vesktop) arrive as temp PNG files whose path changes
- * on every update, so for files we hash the content instead of the path. */
-function iconSignature(proxy) {
-    let icon = null;
-    try {
-        icon = proxy.icon_name;
-    } catch (e) {
-        return null;
-    }
-    if (!icon) return null;
-
-    if (icon.includes("/")) {
-        try {
-            let [ok, bytes] = GLib.file_get_contents(icon);
-            if (!ok || !bytes || bytes.length === 0) return null;
-            return "img:" + GLib.compute_checksum_for_data(GLib.ChecksumType.MD5, bytes);
-        } catch (e) {
-            return null; // file already replaced - the next update will tell us
-        }
-    }
-    return "icon:" + icon;
-}
-
-const XAPP_PREFIX = "org.x.statusicon.";
-
-function prettyName(name) {
-    let n = name || "";
-    if (n.startsWith("app:")) return n.substring(4);
-    if (n.startsWith("untitled:")) return n.substring(9);
-    if (n === "untitled") return "(unnamed icon)";
-    if (n.startsWith("flatpak:")) {
-        let parts = n.substring(8).split(".");
-        return parts[parts.length - 1];       // dev.aunetx.deezer -> deezer
-    }
-    if (n.toLowerCase().startsWith(XAPP_PREFIX)) {
-        n = n.substring(XAPP_PREFIX.length);
-    }
-    return n;
+function unpackVariant(v) {
+    while (v instanceof GLib.Variant) v = v.deep_unpack();
+    return v;
 }
 
 function plainText(markup) {
@@ -275,8 +142,222 @@ function truncate(s, len) {
     return s.length > len ? s.substring(0, len - 1) + "…" : s;
 }
 
-/* Menu items that don't depend on the theme's switch images (some themes
- * draw "on" and "off" the same) and keep the menu open when clicked. */
+// Same normalisation Mint's tray service uses for icon names.
+function sortableName(s) {
+    return String(s).normalize("NFD").toLowerCase();
+}
+
+function isProgramId(id) {
+    return id.startsWith("app:") || id.startsWith("flatpak:");
+}
+
+// Names that are only a temporary D-Bus connection, never stored.
+function isUnstableName(name) {
+    return name.startsWith(":") || /statusnotifieritem-\d+-\d+$/i.test(name);
+}
+
+function prettyName(id) {
+    let n = id || "";
+    if (n.startsWith("app:")) return n.substring(4);
+    if (n.startsWith("flatpak:")) {
+        let parts = n.substring(8).split(".");
+        return parts[parts.length - 1];           // dev.vencord.vesktop -> vesktop
+    }
+    if (n === UNTITLED) return _("(unnamed icon)");
+    if (n.toLowerCase().startsWith(XAPP_PREFIX)) return n.substring(XAPP_PREFIX.length);
+    return n;
+}
+
+/* Display names ("OBS Studio" instead of "studio") from the app list Cinnamon
+ * keeps in memory for its menu. Matched by Flatpak id, desktop file name,
+ * program name or window class. */
+const LAUNCHER_EXES = ["flatpak", "env", "sh", "bash", "python", "python3", "java", "electron", "snap", "gtk-launch"];
+
+function stripExtension(name) {
+    return name.replace(/\.(py|bin|sh|appimage|exe)$/i, "");
+}
+
+class AppNames {
+    constructor() {
+        this._index = null;
+    }
+
+    invalidate() {
+        this._index = null;
+    }
+
+    _build() {
+        let index = new Map();
+        let add = (key, name) => {
+            if (key && name && !index.has(key)) index.set(key, name);
+        };
+
+        let apps = [];
+        try {
+            apps = Cinnamon.AppSystem.get_default().get_all();
+        } catch (e) { /* no app list: fall back to plain names */ }
+
+        for (let app of apps) {
+            let name = app.get_name();
+            add("id:" + (app.get_id() || "").toLowerCase().replace(/\.desktop$/, ""), name);
+            try {
+                add("id:" + (app.get_flatpak_app_id() || "").toLowerCase(), name);
+            } catch (e) { /* older Cinnamon */ }
+
+            let info = app.get_app_info();
+            if (!info) continue;
+            try {
+                let exe = info.get_executable();
+                let base = exe ? GLib.path_get_basename(exe).toLowerCase() : "";
+                if (base && !LAUNCHER_EXES.includes(base)) add("exe:" + stripExtension(base), name);
+            } catch (e) { /* ignore */ }
+            try {
+                let wmClass = info.get_startup_wm_class();
+                if (wmClass) add("exe:" + wmClass.toLowerCase(), name);
+            } catch (e) { /* ignore */ }
+        }
+        this._index = index;
+    }
+
+    lookup(id) {
+        if (!id || id === UNTITLED) return null;
+        if (!this._index) this._build();
+
+        if (id.startsWith("flatpak:")) return this._index.get("id:" + id.substring(8)) || null;
+        let key = stripExtension(id.startsWith("app:") ? id.substring(4) : id.toLowerCase());
+        return this._index.get("id:" + key) || this._index.get("exe:" + key) || null;
+    }
+}
+
+/* What the icon currently looks like. Pixmap icons (Electron apps) arrive as
+ * temp PNG files whose path changes on every update, so files are hashed. */
+async function iconSignature(iconName) {
+    if (!iconName) return null;
+    if (!iconName.includes("/")) return "icon:" + iconName;
+
+    let bytes = await readFile(iconName);
+    if (!bytes || bytes.length === 0) return null;
+    return "img:" + GLib.compute_checksum_for_data(GLib.ChecksumType.MD5, bytes);
+}
+
+
+/* ------------------------------------------------------------------------
+ * Which program is behind a tray icon
+ *
+ * Mint's tray service (xapp-sn-watcher) relays most apps' tray icons and
+ * names each one after the app's tray title, its tray id or its connection,
+ * switching between them while the app runs. The program behind the icon
+ * never changes, so settings are stored under it ("app:cryptomator",
+ * "flatpak:dev.vencord.vesktop").
+ * ---------------------------------------------------------------------- */
+
+async function pidForBusName(busName) {
+    let m = busName.match(/statusnotifieritem-(\d+)-\d+$/i);
+    if (m) return parseInt(m[1]);
+
+    let reply = await dbusCall("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+        "GetConnectionUnixProcessID", new GLib.Variant("(s)", [busName]), "(u)");
+    return reply ? reply[0] : 0;
+}
+
+// Flatpak apps talk to D-Bus through a shared helper; the sandbox info names the app.
+async function flatpakAppId(pid) {
+    let info = await readFile("/proc/" + pid + "/root/.flatpak-info");
+    if (info) {
+        try {
+            let kf = new GLib.KeyFile();
+            kf.load_from_bytes(new GLib.Bytes(info), GLib.KeyFileFlags.NONE);
+            let name = kf.get_string("Application", "name");
+            if (name) return name;
+        } catch (e) { /* not a Flatpak */ }
+    }
+
+    let cgroup = await readFile("/proc/" + pid + "/cgroup");
+    if (cgroup) {
+        let m = decode(cgroup).match(/app-flatpak-([A-Za-z0-9._-]+?)-\d+\.scope/);
+        if (m) return m[1];
+    }
+    return null;
+}
+
+function isGenericExe(name) {
+    return !name || GENERIC_EXES.includes(name.replace(/[0-9.]+$/, ""));
+}
+
+async function programName(pid) {
+    let base = "";
+
+    let exe = await readLink("/proc/" + pid + "/exe");
+    if (exe) base = GLib.path_get_basename(exe).replace(/ \(deleted\)$/, "");
+
+    if (isGenericExe(base)) {
+        let comm = await readFile("/proc/" + pid + "/comm");
+        let c = comm ? decode(comm).trim() : "";
+        if (c) base = c;
+    }
+
+    // Still generic (e.g. "electron", "python3")? Use the app path it runs.
+    if (isGenericExe(base)) {
+        let cmdline = await readFile("/proc/" + pid + "/cmdline");
+        let args = cmdline ? decode(cmdline).split("\0").slice(1).filter(a => a && !a.startsWith("-")) : [];
+        if (args.length) {
+            let parts = args[0].split("/").filter(x => x);
+            let name = parts.pop() || "";
+            if (["app", "app.asar", "resources", "main.js", "index.js", "main.py", "__main__.py"].includes(name)) {
+                name = parts.filter(x => x !== "resources").pop() || name;
+            }
+            name = name.replace(/\.(asar|py|jar|js)$/, "");
+            if (name) base = name;
+        }
+    }
+    return base.toLowerCase();
+}
+
+async function programIdForPid(pid) {
+    if (!pid) return "";
+    let fp = await flatpakAppId(pid);
+    if (fp) return "flatpak:" + fp.toLowerCase();
+    let prog = await programName(pid);
+    return prog ? "app:" + prog : "";
+}
+
+// Map of every name Mint's tray service may use for an icon -> program id.
+async function buildTrayProgramMap() {
+    let reply = await dbusCall("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+        "org.freedesktop.DBus.Properties", "Get",
+        new GLib.Variant("(ss)", ["org.kde.StatusNotifierWatcher", "RegisteredStatusNotifierItems"]), "(v)");
+    let map = new Map();
+    if (!reply) return map;
+
+    let items = unpackVariant(reply[0]) || [];
+    await Promise.all(items.map(async item => {
+        let i = item.indexOf("/");
+        let bus = i >= 0 ? item.substring(0, i) : item;
+        let path = i >= 0 ? item.substring(i) : "/StatusNotifierItem";
+
+        let prog = await programIdForPid(await pidForBusName(bus));
+        if (!prog) return;
+
+        let names = [bus];
+        for (let prop of ["Id", "Title"]) {
+            let r = await dbusCall(bus, path, "org.freedesktop.DBus.Properties", "Get",
+                new GLib.Variant("(ss)", ["org.kde.StatusNotifierItem", prop]), "(v)");
+            let v = r ? unpackVariant(r[0]) : null;
+            if (typeof v === "string" && v) names.push(v);
+        }
+        for (let n of names) {
+            if (!map.has(sortableName(n))) map.set(sortableName(n), prog);
+        }
+    }));
+    return map;
+}
+
+
+/* ------------------------------------------------------------------------
+ * Menu items that don't depend on the theme's switch images (some themes
+ * draw "on" and "off" alike) and keep the menu open when clicked.
+ * ---------------------------------------------------------------------- */
+
 class ToggleItem extends PopupMenu.PopupBaseMenuItem {
     _init(text, state, onText, offText) {
         super._init.call(this, {});
@@ -322,70 +403,202 @@ class ActionItem extends PopupMenu.PopupMenuItem {
     }
 }
 
-/* One hidden XApp icon, drawn inside the overflow popup. */
-class OverflowIcon {
-    constructor(applet, proxy) {
-        this.applet = applet;
-        this.proxy = proxy;
 
-        this.actor = new St.Bin({
+/* ------------------------------------------------------------------------
+ * Screen recording indicator (as in the stock tray applet)
+ * ---------------------------------------------------------------------- */
+
+class RecorderIcon {
+    constructor(applet) {
+        this.applet = applet;
+        this.actor = new St.BoxLayout({
             style_class: "applet-box",
-            style: "padding: 4px;",
-            reactive: true,
-            track_hover: true,
-            can_focus: true
+            reactive: false,
+            visible: false,
+            x_expand: true,
+            y_expand: true
         });
 
-        this._tooltip = new Tooltips.Tooltip(this.actor, "");
+        this.icon_holder = new St.Bin();
+        this.iconSize = this.applet.getPanelIconSize(St.IconType.FULLCOLOR);
+        this.actor.add_actor(this.icon_holder);
 
-        this._pressedButton = 0;
-        this.actor.connect("button-press-event", (a, e) => this._onPress(a, e));
-        this.actor.connect("button-release-event", (a, e) => this._onRelease(a, e));
-        this.actor.connect("scroll-event", (a, e) => this._onScroll(a, e));
+        this._indicator = new St.DrawingArea();
+        this._indicator.connect("repaint", area => this._paint(area));
+        this.icon_holder.add_actor(this._indicator);
 
-        this._propsId = this.proxy.connect("g-properties-changed", () => this.refresh());
+        this._recordListenerId = Main.screenRecorder.connect("recording", () => this._recordingStateChanged());
+        this._recordingStateChanged();
 
         this.refresh();
     }
 
-    get sortName() {
-        return prettyName(this.proxy.name).toLowerCase();
+    _recordingStateChanged() {
+        this.actor.visible = Main.screenRecorder.recording;
+        this._indicator.queue_repaint();
+    }
+
+    _paint(area) {
+        let [width, height] = area.get_surface_size();
+        let size = Math.max(width, height);
+        let border = area.get_theme_node().get_foreground_color();
+        let cr = area.get_context();
+
+        Clutter.cairo_set_source_color(cr, new Clutter.Color({ red: 255, green: 0, blue: 0, alpha: 255 }));
+        cr.arc(width / 2, height / 2, size / 4.0, 0.0, 2.0 * Math.PI);
+        cr.fillPreserve();
+        Clutter.cairo_set_source_color(cr, border);
+        cr.stroke();
+        cr.$dispose();
+    }
+
+    refresh() {
+        let vertical = this.applet.orientation == St.Side.LEFT || this.applet.orientation == St.Side.RIGHT;
+        this.actor.vertical = vertical;
+        this.iconSize = this.applet.getPanelIconSize(St.IconType.FULLCOLOR);
+        this._indicator.set_size(this.iconSize, this.iconSize);
+        this._indicator.queue_repaint();
+    }
+
+    destroy() {
+        if (this._recordListenerId > 0) {
+            Main.screenRecorder.disconnect(this._recordListenerId);
+            this._recordListenerId = 0;
+        }
+        this.actor.destroy();
+    }
+}
+
+
+/* ------------------------------------------------------------------------
+ * One tray icon. It lives either in the panel or in the overflow popup;
+ * the applet moves its actor between the two.
+ * ---------------------------------------------------------------------- */
+
+class TrayIcon {
+    constructor(applet, entry) {
+        this.applet = applet;
+        this.entry = entry;
+        this.proxy = entry.proxy;
+        this.inOverflow = false;
+        this._timers = new Set();
+        this._loaderHandle = null;
+
+        this.actor = new St.BoxLayout({
+            style_class: "applet-box",
+            reactive: !global.settings.get_boolean("panel-edit-mode"),
+            track_hover: true,
+            // Fill the space, or the app's menu would be placed inside the panel.
+            x_expand: true,
+            y_expand: true
+        });
+
+        this.icon_holder = new St.Bin();
+        this.label = new St.Label({ "y-align": St.Align.END });
+        this.actor.add_actor(this.icon_holder);
+        this.actor.add_actor(this.label);
+
+        this._tooltip = new Tooltips.PanelItemTooltip(this, "", applet.orientation);
+
+        this.actor.connect("button-press-event", (a, e) => this._onButtonPress(a, e));
+        this.actor.connect("button-release-event", (a, e) => this._onButtonRelease(a, e));
+        this.actor.connect("scroll-event", (a, e) => this._onScroll(a, e));
+        this.actor.connect("enter-event", () => { this._tooltip.preventShow = false; });
+
+        this._propsId = this.proxy.connect("g-properties-changed", (p, changed) => this._onPropertiesChanged(changed));
+
+        this.refresh();
+    }
+
+    setOverflow(inOverflow) {
+        if (this.inOverflow === inOverflow) return;
+        this.inOverflow = inOverflow;
+        this.refresh();
     }
 
     get isVisible() {
         return !!this.proxy.visible;
     }
 
-    refresh() {
-        this._updateIcon();
+    _onPropertiesChanged(changed) {
+        let props = changed.deep_unpack();
 
-        let tip = plainText(this.proxy.tooltip_text) || prettyName(this.proxy.name);
-        this._tooltip.set_text(tip);
-
-        this.actor.visible = this.isVisible;
+        if ("IconName" in props) this._setIconName(this.proxy.icon_name);
+        if ("TooltipText" in props) this._setTooltipText(this.proxy.tooltip_text);
+        if ("Label" in props) this._setLabel(this.proxy.label);
+        if ("Visible" in props) this.actor.visible = this.isVisible;
+        if (("PrimaryMenuIsOpen" in props && !this.proxy.primary_menu_is_open) ||
+            ("SecondaryMenuIsOpen" in props && !this.proxy.secondary_menu_is_open)) {
+            this.actor.sync_hover();
+        }
     }
 
-    _updateIcon() {
-        let name = this.proxy.icon_name;
-        let size = this.applet.overflowIconSize;
-        let symbolic = !!(name && name.match(/symbolic/));
-        let type = symbolic ? St.IconType.SYMBOLIC : St.IconType.FULLCOLOR;
-        let icon;
+    refresh() {
+        let vertical = !this.inOverflow &&
+            (this.applet.orientation == St.Side.LEFT || this.applet.orientation == St.Side.RIGHT);
+        this.actor.vertical = vertical;
+        if (vertical) this.actor.add_style_class_name("vertical");
+        else this.actor.remove_style_class_name("vertical");
 
-        try {
-            if (this.proxy.icon_size !== size) this.proxy.icon_size = size;
-        } catch (e) { /* not fatal */ }
+        // In the panel the icon fills its slot (the app's menu is placed by
+        // it); in the popup grid it keeps its natural size.
+        this.actor.x_expand = !this.inOverflow;
+        this.actor.y_expand = !this.inOverflow;
+        this.actor.set_style(this.inOverflow ? "padding: 4px;" : null);
 
-        if (!name) {
-            icon = new St.Icon({ icon_name: "application-x-executable", icon_type: St.IconType.FULLCOLOR, icon_size: size });
-        } else if (name.includes("/")) {
-            let gicon = new Gio.FileIcon({ file: Gio.File.new_for_path(name) });
-            icon = new St.Icon({ gicon: gicon, icon_type: type, icon_size: size });
-        } else {
-            icon = new St.Icon({ icon_name: name, icon_type: type, icon_size: size });
+        this._setIconName(this.proxy.icon_name);
+        this._setLabel(this.proxy.label);
+        this._setTooltipText(this.proxy.tooltip_text);
+        this.actor.visible = this.isVisible;
+        this.actor.queue_relayout();
+    }
+
+    _iconSize(type) {
+        return this.inOverflow ? this.applet.overflowIconSize : this.applet.getPanelIconSize(type);
+    }
+
+    _setIconName(iconName) {
+        if (!iconName) {
+            this.icon_holder.hide();
+            return;
         }
 
-        this.actor.set_child(icon);
+        let type = iconName.match(/symbolic/) ? St.IconType.SYMBOLIC : St.IconType.FULLCOLOR;
+        let size = this._iconSize(type);
+        if (this.proxy.icon_size !== size) this.proxy.icon_size = size;
+
+        // Symbolic icons are assumed to be square and suitable for an St.Icon.
+        if (iconName.includes("/") && type != St.IconType.SYMBOLIC) {
+            this._loaderHandle = St.TextureCache.get_default().load_image_from_file_async(
+                iconName,
+                // In a horizontal panel the image may be wider than tall.
+                (this.actor.vertical || this.inOverflow) ? size : -1,
+                size,
+                (cache, handle, actor) => {
+                    if (handle !== this._loaderHandle) return;   // a newer icon is on its way
+                    this.icon_holder.child = actor;
+                    this.icon_holder.show();
+                });
+            return;
+        }
+
+        this.icon_holder.child = new St.Icon({ icon_type: type, icon_size: size, icon_name: iconName });
+        this.icon_holder.show();
+    }
+
+    _setTooltipText(text) {
+        this._tooltip.preventShow = !text;
+        this._tooltip.set_markup(text || "");
+        if (this._tooltip.visible) {
+            this._tooltip.hide();
+            this._tooltip.show();
+        }
+    }
+
+    _setLabel(text) {
+        this.label.set_text(text || "");
+        let horizontal = this.applet.orientation == St.Side.TOP || this.applet.orientation == St.Side.BOTTOM;
+        this.label.visible = !this.inOverflow && horizontal && !!text;
     }
 
     _positionInfo() {
@@ -408,53 +621,51 @@ class OverflowIcon {
         }
     }
 
-    // Same sequence as the panel: press is forwarded on press, release on
-    // the real release. Apps open their menus on release, and they can only
-    // grab the pointer once the button is up and our popup's grab is gone -
-    // so the popup closes on release, right before the release is forwarded.
-    _onPress(actor, event) {
+    _onButtonPress(actor, event) {
         this._tooltip.hide();
+        this._tooltip.preventShow = true;
 
-        let button = event.get_button();
-        let [x, y, o] = this._positionInfo();
-        this._pressedButton = button;
-
-        try {
-            this.proxy.call_button_press(x, y, button, event.get_time(), o, null, null);
-        } catch (e) {
-            global.logError("Tray Overflow: press forwarding failed: " + e);
+        // Ctrl + right click opens the applet's own menu (as in the stock tray).
+        if (event.get_button() == Clutter.BUTTON_SECONDARY && (event.get_state() & Clutter.ModifierType.CONTROL_MASK)) {
+            return Clutter.EVENT_PROPAGATE;
         }
 
+        let [x, y, o] = this._positionInfo();
+        this.proxy.call_button_press(x, y, event.get_button(), event.get_time(), o, null, null);
+        this._pressedButton = event.get_button();
         return Clutter.EVENT_STOP;
     }
 
-    _onRelease(actor, event) {
+    _onButtonRelease(actor, event) {
         let button = event.get_button();
+        let [x, y, o] = this._positionInfo();
+
+        if (!this.inOverflow) {
+            this.proxy.call_button_release(x, y, button, event.get_time(), o, null, null);
+            return Clutter.EVENT_STOP;
+        }
+
         if (button !== this._pressedButton) return Clutter.EVENT_STOP;
         this._pressedButton = 0;
 
-        let [x, y, o] = this._positionInfo();
-        let proxy = this.proxy;
-
-        // Keep the popup visible, but give up its pointer grab so the app
-        // can open its menu on top of it.
-        this.applet.handOff(proxy);
+        // In the popup: give up the popup's pointer grab (it stays visible),
+        // then forward the release so the app can open its menu on top.
+        this.applet.handOff(this.proxy);
         global.stage.set_key_focus(null);
 
-        Mainloop.timeout_add(50, () => {
-            try {
-                proxy.call_button_release(x, y, button, Clutter.CURRENT_TIME, o, null, null);
-            } catch (e) {
-                global.logError("Tray Overflow: release forwarding failed: " + e);
-            }
+        let id = Mainloop.timeout_add(50, () => {
+            this._timers.delete(id);
+            this.proxy.call_button_release(x, y, button, Clutter.CURRENT_TIME, o, null, null);
             return GLib.SOURCE_REMOVE;
         });
-
+        this._timers.add(id);
         return Clutter.EVENT_STOP;
     }
 
     _onScroll(actor, event) {
         let direction = event.get_scroll_direction();
+        if (direction == Clutter.ScrollDirection.SMOOTH) return Clutter.EVENT_STOP;
+
         let map = {};
         map[Clutter.ScrollDirection.UP] = [XApp.ScrollDirection.UP, -1];
         map[Clutter.ScrollDirection.DOWN] = [XApp.ScrollDirection.DOWN, 1];
@@ -463,14 +674,14 @@ class OverflowIcon {
 
         if (map[direction]) {
             let [dir, delta] = map[direction];
-            try {
-                this.proxy.call_scroll(delta, dir, event.get_time(), null, null);
-            } catch (e) { /* ignore */ }
+            this.proxy.call_scroll(delta, dir, event.get_time(), null, null);
         }
         return Clutter.EVENT_STOP;
     }
 
     destroy() {
+        for (let id of this._timers) Mainloop.source_remove(id);
+        this._timers.clear();
         if (this._propsId) {
             this.proxy.disconnect(this._propsId);
             this._propsId = 0;
@@ -480,7 +691,12 @@ class OverflowIcon {
     }
 }
 
-class TrayOverflowApplet extends Applet.IconApplet {
+
+/* ------------------------------------------------------------------------
+ * The applet
+ * ---------------------------------------------------------------------- */
+
+class TrayOverflowApplet extends Applet.Applet {
     constructor(metadata, orientation, panelHeight, instanceId) {
         super(orientation, panelHeight, instanceId);
 
@@ -488,267 +704,733 @@ class TrayOverflowApplet extends Applet.IconApplet {
         this.orientation = orientation;
         this.setAllowedLayout(Applet.AllowedLayout.BOTH);
 
+        this.actor.remove_style_class_name("applet-box");
+        this.actor.set_important(true);
+
         this.settings = new Settings.AppletSettings(this, this.uuid, instanceId);
         this.settings.bind("hide-new-icons", "hideNewIcons", () => this._onHideNewChanged());
-        this.settings.bind("columns", "columns", () => this._layoutGrid());
-        this.settings.bind("overflow-icon-size", "overflowIconSize", () => this._refreshOverflowIcons());
         this.settings.bind("attention-delay-in", "attentionDelayIn", null);
         this.settings.bind("attention-delay-out", "attentionDelayOut", null);
+        this.settings.bind("columns", "columns", () => this._layoutGrid());
+        this.settings.bind("overflow-icon-size", "overflowIconSize", () => this._refreshIcons());
+        this.settings.bind("debug-log", "debugLog", null);
+        this.settings.bind("button-icon", "buttonIcon", () => this._setChevronIcon());
+        this.settings.bind("use-custom-icon", "useCustomIcon", () => this._setChevronIcon());
+        this.settings.bind("button-custom-icon", "buttonCustomIcon", () => this._setChevronIcon());
+        this.settings.bind("show-count", "showCount", () => this._layoutGrid());
+        this.settings.bind("open-on-hover", "openOnHover", () => this._onOpenOnHoverChanged());
+        this.settings.bind("hover-delay", "hoverDelay", null);
+        this.settings.bind("close-delay", "closeDelay", null);
 
-        this._popped = new Set();       // hidden apps currently moved into the panel
-        this._attnTimers = {};          // name -> pending move timer
+        this._appNames = new AppNames();
+        this.entries = {};          // proxy key -> entry
+        this._popped = new Set();   // hidden ids currently shown in the panel (icon changed)
+        this._attnTimers = {};      // id -> pending move timer
+        this._handoff = null;
+        this._removed = false;
 
-        this.xappIcons = {};      // key -> { proxy, name, overflow: OverflowIcon|null }
-        this.legacyIcons = [];    // [{ icon, role }]
         this.signals = new SignalManager.SignalManager(null);
-        this.monitorSignals = new SignalManager.SignalManager(null);
-        this._hookedMonitor = null;
-        this._ownMonitor = null;
-        this._noStockCount = 0;
 
-        this._setButtonIcon();
+        // Panel: [^] [visible icons ...] [recording indicator]
+        let vertical = orientation == St.Side.LEFT || orientation == St.Side.RIGHT;
+        this.manager_container = new St.BoxLayout({ vertical: vertical, style: vertical ? VERTICAL_STYLE : HORIZONTAL_STYLE });
+        this.actor.add_actor(this.manager_container);
+
+        // The panel button: icon, plus optionally the number of hidden icons.
+        this._chevronIcon = new St.Icon({ icon_type: St.IconType.SYMBOLIC });
+        this._chevronCount = new St.Label({ style_class: "applet-label", y_align: Clutter.ActorAlign.CENTER, visible: false });
+        this._chevron = new St.BoxLayout({ style_class: "applet-box", reactive: true, track_hover: true });
+        this._chevron.add_actor(this._chevronIcon);
+        this._chevron.add_actor(this._chevronCount);
+        this._chevron.connect("enter-event", () => this._onChevronEnter());
+        this._chevron.connect("leave-event", () => this._cancelHoverOpen());
+        this._chevronTooltip = new Tooltips.Tooltip(this._chevron, "");
+        this.manager_container.add_actor(this._chevron);
+        this._setChevronIcon();
+
+        this._recorder = Main.screenRecorder ? new RecorderIcon(this) : null;
+        if (this._recorder) this.manager_container.add_actor(this._recorder.actor);
+
         this._buildMenus();
+
+        this.monitor = new XApp.StatusIconMonitor();
+        this.signals.connect(this.monitor, "icon-added", (m, proxy) => this._onIconAdded(proxy));
+        this.signals.connect(this.monitor, "icon-removed", (m, proxy) => this._onIconRemoved(proxy));
+
+        this.signals.connect(Gtk.IconTheme.get_default(), "changed", () => this._refreshIcons());
+        this.signals.connect(global.settings, "changed::panel-edit-mode", () => this._onPanelEditModeChanged());
+        // Icons other applets display themselves (e.g. the network applet's).
+        this.signals.connect(Main.systrayManager, "changed", () => this._placeAll());
+        // Listen to the panel directly: the applet holds symbolic and full-colour icons.
+        this.signals.connect(this.panel, "icon-size-changed", () => this._refreshIcons());
+        this.signals.connect(global, "scale-changed", () => this._onScaleChanged());
+        try {
+            this.signals.connect(Cinnamon.AppSystem.get_default(), "installed-changed", () => {
+                this._appNames.invalidate();
+                this._refreshOpenLists();
+            });
+        } catch (e) { /* ignore */ }
     }
 
-    /* ---------- settings helpers ---------- */
+    _displayName(id) {
+        return this._appNames.lookup(id) || prettyName(id);
+    }
+
+    _log(msg) {
+        if (this.debugLog) global.log("Tray Overflow: " + msg);
+    }
+
+    /* ---------- settings ---------- */
 
     _getList(key) {
         let v = this.settings.getValue(key);
         return Array.isArray(v) ? v.slice() : [];
     }
 
-    // The user's choice (switch in the list).
-    _isHidden(name) {
-        // Relayed icons start without a name at login; keep them out of the
-        // panel during that moment unless "(unnamed icon)" is set to Panel.
-        if (name === "untitled") return !this._getList("shown-list").includes(name);
-        return this._getList("hidden-list").includes(name);
+    _getRules() {
+        let r = this.settings.getValue("attention-rules");
+        return (r && typeof r === "object" && !Array.isArray(r)) ? JSON.parse(JSON.stringify(r)) : {};
+    }
+
+    _getRule(id) {
+        let r = this._getRules()[id];
+        return (r && r.enabled) ? r : null;
+    }
+
+    _saveRule(id, rule) {
+        let rules = this._getRules();
+        if (rule) rules[id] = rule;
+        else delete rules[id];
+        this.settings.setValue("attention-rules", rules);
+    }
+
+    // The user's choice. Unnamed icons (apps still starting) stay out of the
+    // panel unless "(unnamed icon)" is set to Panel.
+    _isHidden(id) {
+        if (id === UNTITLED) return !this._getList("shown-list").includes(id);
+        return this._getList("hidden-list").includes(id);
     }
 
     // What actually happens right now: hidden, unless its icon changed.
-    _isEffectivelyHidden(name) {
-        return this._isHidden(name) && !this._popped.has(name);
+    _isEffectivelyHidden(id) {
+        return this._isHidden(id) && !this._popped.has(id);
     }
 
-    _setHidden(name, hidden) {
-        this._popped.delete(name);
-        this._cancelAttnTimer(name);
-        let hiddenList = this._getList("hidden-list").filter(n => n !== name);
-        let shownList = this._getList("shown-list").filter(n => n !== name);
+    _hasSettings(id) {
+        return this._getList("hidden-list").includes(id) ||
+               this._getList("shown-list").includes(id) ||
+               !!this._getRules()[id];
+    }
 
-        if (hidden) hiddenList.push(name);
-        else shownList.push(name);
+    _setHidden(id, hidden) {
+        this._popped.delete(id);
+        this._cancelAttnTimer(id);
 
+        let hiddenList = this._getList("hidden-list").filter(n => n !== id);
+        let shownList = this._getList("shown-list").filter(n => n !== id);
+        if (hidden) hiddenList.push(id);
+        else shownList.push(id);
         this.settings.setValue("hidden-list", hiddenList);
         this.settings.setValue("shown-list", shownList);
 
-        this._applyRoles();
-        this._syncOverflow();
-        if (hidden) this._evaluateName(name);
+        this._placeAll();
+        if (hidden) this._evaluateId(id);
+    }
+
+    _forgetId(id) {
+        for (let key of ["hidden-list", "shown-list"]) {
+            let list = this._getList(key);
+            if (list.includes(id)) this.settings.setValue(key, list.filter(n => n !== id));
+        }
+        let rules = this._getRules();
+        if (rules[id]) {
+            delete rules[id];
+            this.settings.setValue("attention-rules", rules);
+        }
+        this._cancelAttnTimer(id);
+        this._popped.delete(id);
+    }
+
+    // Copy settings of one id onto another. Without onlyMissing, panel/hidden
+    // and the "icon changes" rule of `from` replace those of `to`.
+    _mergeInto(from, to, onlyMissing) {
+        let hidden = this._getList("hidden-list");
+        let shown = this._getList("shown-list");
+        let rules = this._getRules();
+
+        let toHasState = hidden.includes(to) || shown.includes(to);
+        if ((hidden.includes(from) || shown.includes(from)) && !(onlyMissing && toHasState)) {
+            let intoHidden = hidden.includes(from);
+            hidden = hidden.filter(n => n !== to);
+            shown = shown.filter(n => n !== to);
+            (intoHidden ? hidden : shown).push(to);
+            this.settings.setValue("hidden-list", hidden);
+            this.settings.setValue("shown-list", shown);
+        }
+        if (rules[from] && !(onlyMissing && rules[to])) {
+            rules[to] = JSON.parse(JSON.stringify(rules[from]));
+            this.settings.setValue("attention-rules", rules);
+        }
     }
 
     on_show_all_clicked() {
-        this._popped.clear();
         let shownList = this._getList("shown-list");
         for (let n of this._getList("hidden-list")) {
             if (!shownList.includes(n)) shownList.push(n);
         }
+        this._popped.clear();
         this.settings.setValue("hidden-list", []);
         this.settings.setValue("shown-list", shownList);
-        this._applyRoles();
-        this._syncOverflow();
+        this._placeAll();
     }
 
     _onHideNewChanged() {
         if (!this.hideNewIcons) return;
-        // Apply the rule to icons that are already there but undecided.
-        let changed = false;
-        let hiddenList = this._getList("hidden-list");
-        let shownList = this._getList("shown-list");
-        for (let entry of this._knownEntries()) {
-            if (!hiddenList.includes(entry.name) && !shownList.includes(entry.name)) {
-                hiddenList.push(entry.name);
-                changed = true;
-            }
-        }
-        if (changed) {
-            this.settings.setValue("hidden-list", hiddenList);
-            this._applyRoles();
-            this._syncOverflow();
+        for (let entry of Object.values(this.entries)) {
+            if (entry.settled && !this._hasSettings(entry.id)) this._setHidden(entry.id, true);
         }
     }
 
-    _maybeAutoHide(name) {
-        if (!this.hideNewIcons || !name) return;
-        let hiddenList = this._getList("hidden-list");
-        if (hiddenList.includes(name) || this._getList("shown-list").includes(name)) return;
-        hiddenList.push(name);
-        this.settings.setValue("hidden-list", hiddenList);
-        // Deferred: we may be inside the tray's own redisplay loop right now.
-        this._scheduleApply();
+    /* ---------- icons coming and going ---------- */
+
+    _key(proxy) {
+        return proxy.get_name() + proxy.get_object_path();
     }
 
-    _scheduleApply() {
-        if (this._applyId) return;
-        this._applyId = Mainloop.idle_add(() => {
-            this._applyId = 0;
-            this._applyRoles();
-            this._syncOverflow();
+    _onIconAdded(proxy) {
+        let key = this._key(proxy);
+        if (this.entries[key]) return;
+
+        let entry = {
+            key: key,
+            proxy: proxy,
+            role: "",          // the name the icon has right now (lower case)
+            id: null,          // the id settings are stored under, once known
+            progId: null,      // program id, kept through any later renames
+            settled: false,
+            idSeq: 0,
+            sigSeq: 0,
+            lastSig: null,
+            icon: null,
+            settleTimer: 0,
+            propsId: 0
+        };
+        this.entries[key] = entry;
+
+        entry.propsId = proxy.connect("g-properties-changed", (p, changed) => {
+            let props = changed.deep_unpack();
+            if ("Name" in props) this._identify(entry);
+            if ("IconName" in props || "Visible" in props) this._evaluateAttention(entry);
+            if ("Visible" in props) this._layoutGridLater();
+        });
+
+        this._log("icon added: \"" + (proxy.name || "") + "\"");
+        this._identify(entry);
+    }
+
+    _onIconRemoved(proxy) {
+        let entry = this.entries[this._key(proxy)];
+        if (!entry) return;
+
+        this._log("icon removed: " + (entry.id || entry.role));
+        this._destroyEntry(entry);
+        delete this.entries[entry.key];
+
+        if (entry.id && !Object.values(this.entries).some(e => e.id === entry.id)) {
+            this._cancelAttnTimer(entry.id);
+            this._popped.delete(entry.id);
+        }
+        this._afterPlacementChange();
+    }
+
+    _destroyEntry(entry) {
+        if (entry.settleTimer) {
+            Mainloop.source_remove(entry.settleTimer);
+            entry.settleTimer = 0;
+        }
+        if (entry.propsId) {
+            entry.proxy.disconnect(entry.propsId);
+            entry.propsId = 0;
+        }
+        if (entry.icon) {
+            entry.icon.destroy();
+            entry.icon = null;
+        }
+    }
+
+    /* ---------- identifying icons ----------
+     * An icon is only shown once we know which app it belongs to (usually a
+     * few milliseconds); until then it is invisible, so nothing flashes in
+     * the panel while apps start. */
+
+    _identify(entry) {
+        entry.role = (entry.proxy.name || "").toLowerCase();
+
+        // Known program: renames don't change anything.
+        if (entry.progId) return;
+
+        let seq = ++entry.idSeq;
+        let raw = entry.proxy.name || "";
+
+        if (!entry.settled && !entry.settleTimer) {
+            entry.settleTimer = Mainloop.timeout_add(SETTLE_TIMEOUT_MS, () => {
+                entry.settleTimer = 0;
+                if (!entry.settled) this._settle(entry, entry.role && !isUnstableName(entry.role) ? entry.role : UNTITLED);
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+
+        if (!raw) return;   // nameless: wait for the name (or the timeout)
+
+        if (isUnstableName(raw)) {
+            pidForBusName(raw).then(pid => programIdForPid(pid)).then(prog => {
+                if (this._removed || seq !== entry.idSeq || this.entries[entry.key] !== entry) return;
+                if (prog) this._settle(entry, prog);
+            }).catch(e => global.logError("Tray Overflow: " + e));
+            return;
+        }
+
+        entry.waitingForMap = seq;
+        this._scheduleResolve();
+    }
+
+    _scheduleResolve() {
+        if (this._resolveId) return;
+        this._resolveId = Mainloop.timeout_add(250, () => {
+            this._resolveId = 0;
+            this._resolveFromTrayService().catch(e => global.logError("Tray Overflow: " + e));
             return GLib.SOURCE_REMOVE;
         });
     }
 
-    /* ---------- tell the stock tray applets what to hide ---------- */
+    async _resolveFromTrayService() {
+        let waiting = Object.values(this.entries).filter(e => e.waitingForMap);
+        if (waiting.length === 0) return;
 
-    _applyRoles() {
-        let mgr = Main.systrayManager;
-        let set = new Set();
+        let map = await buildTrayProgramMap();
+        if (this._removed) return;
 
-        // Saved ids that are plain names hide the icon even before we see it.
-        for (let n of this._getList("hidden-list")) {
-            if (!this._popped.has(n) && !n.startsWith("app:") && !isUnstableId(n)) set.add(n.toLowerCase());
-        }
-        // Running icons: hide by whatever name they have right now.
-        for (let key in this.xappIcons) {
-            let e = this.xappIcons[key];
-            // Nameless icons can only be hidden via the empty name "" (which
-            // hides every nameless icon - they're rare).
-            let hideable = e.role || e.name.startsWith("untitled");
-            if (hideable && this._isEffectivelyHidden(e.name)) set.add(e.role);
-        }
-        let names = Array.from(set).sort();
-
-        let sig = names.join("\n");
-        if (sig === this._appliedRoles) return;
-        this._appliedRoles = sig;
-
-        if (Array.isArray(mgr._roles)) {
-            // Batch update -> a single "changed" signal (less flicker).
-            for (let i = mgr._roles.length - 1; i >= 0; i--) {
-                if (mgr._roles[i].uuid === this.uuid) mgr._roles.splice(i, 1);
-            }
-            for (let n of names) {
-                mgr._roles.push({ role: n.toLowerCase(), uuid: this.uuid });
-            }
-            mgr.emit("changed");
-        } else {
-            mgr.unregisterTrayIconReplacement(this.uuid);
-            for (let n of names) mgr.registerTrayIconReplacement(n, this.uuid);
+        for (let entry of waiting) {
+            if (this.entries[entry.key] !== entry || entry.waitingForMap !== entry.idSeq) continue;
+            entry.waitingForMap = 0;
+            // No match: a native XApp icon (e.g. Mint Update) - its name is stable.
+            this._settle(entry, map.get(sortableName(entry.proxy.name || "")) || entry.role);
         }
     }
 
-    _ownedByOtherApplet(name) {
+    _settle(entry, id) {
+        if (entry.settleTimer) {
+            Mainloop.source_remove(entry.settleTimer);
+            entry.settleTimer = 0;
+        }
+        if (isProgramId(id)) entry.progId = id;
+
+        let oldId = entry.id;
+        if (oldId !== id) {
+            this._log("icon \"" + entry.role + "\" is " + id);
+            this._adoptId(entry, oldId, id);
+        }
+        entry.settled = true;
+
+        if (this.hideNewIcons && id !== UNTITLED && !this._hasSettings(id)) {
+            let hiddenList = this._getList("hidden-list");
+            hiddenList.push(id);
+            this.settings.setValue("hidden-list", hiddenList);
+        }
+
+        this._place(entry);
+        this._afterPlacementChange();
+        this._evaluateAttention(entry);
+    }
+
+    /* Give an icon its final id. Settings saved under the previous id, or
+     * under other names the same app had before (older versions stored
+     * names that apps change while running), are folded into it. */
+    _adoptId(entry, oldId, newId) {
+        let inUse = new Set(Object.values(this.entries).filter(e => e !== entry && e.id).map(e => e.id));
+        let leftovers = [];
+
+        if (isProgramId(newId)) {
+            let labels = new Set([prettyName(newId), entry.role, prettyName(entry.role)]);
+            let known = new Set([].concat(this._getList("hidden-list"), this._getList("shown-list"),
+                                          Object.keys(this._getRules())));
+            leftovers = Array.from(known).filter(id =>
+                id !== newId && id !== oldId && id !== UNTITLED && !inUse.has(id) && labels.has(prettyName(id)));
+        }
+
+        // The entry the user last saw in the list wins; leftovers fill gaps.
+        if (oldId && oldId !== newId && oldId !== UNTITLED && this._hasSettings(oldId)) this._mergeInto(oldId, newId);
+        for (let id of leftovers) {
+            if (this._hasSettings(id)) this._mergeInto(id, newId, true);
+        }
+        for (let id of leftovers) this._forgetId(id);
+        if (oldId && oldId !== newId && oldId !== UNTITLED && !inUse.has(oldId)) this._forgetId(oldId);
+
+        if (oldId) {
+            this._cancelAttnTimer(oldId);
+            this._popped.delete(oldId);
+        }
+        entry.id = newId;
+        if (leftovers.length) this._log(newId + ": merged " + leftovers.join(", "));
+    }
+
+    /* ---------- placing icons: panel, overflow, or nowhere ---------- */
+
+    _ignoredByOtherApplet(entry) {
         try {
-            return Main.systrayManager._roles.some(r => r.role === name && r.uuid !== this.uuid);
+            return Main.systrayManager.getRoles().indexOf(entry.role) != -1;
         } catch (e) {
             return false;
         }
     }
 
-    /* ---------- lifecycle ---------- */
-
-    on_applet_added_to_panel() {
-        // Legacy (XEmbed) icons: we only need to know their names.
-        try {
-            let d = Main.statusIconDispatcher;
-            this.signals.connect(d, "status-icon-added", (o, icon, role) => {
-                this.legacyIcons.push({ icon: icon, role: (role || "").toLowerCase() });
-                global.log("Tray Overflow: found legacy tray icon role=\"" + role + "\"");
-                this._maybeAutoHide((role || "").toLowerCase());
-            }, this);
-            this.signals.connect(d, "status-icon-removed", (o, icon) => {
-                this.legacyIcons = this.legacyIcons.filter(e => e.icon !== icon);
-            }, this);
-            this.signals.connect(d, "before-redisplay", () => {
-                this.legacyIcons = [];
-            }, this);
-        } catch (e) {
-            global.logError("Tray Overflow: legacy tray not available: " + e);
+    _place(entry) {
+        let where = "none";
+        if (entry.settled && !this._ignoredByOtherApplet(entry)) {
+            where = this._isEffectivelyHidden(entry.id) ? "overflow" : "panel";
         }
 
-        this._hookMonitor();
-        // The stock applet may load after us, or get reloaded later.
-        this._pollId = Mainloop.timeout_add_seconds(3, () => {
-            try {
-                this._hookMonitor();
-                this._reconcile();
-            } catch (e) {
-                global.logError("Tray Overflow: poll failed: " + e);
+        if (where === "none") {
+            if (entry.icon) {
+                entry.icon.destroy();
+                entry.icon = null;
+            }
+            return;
+        }
+
+        if (!entry.icon) entry.icon = new TrayIcon(this, entry);
+        let actor = entry.icon.actor;
+        let target = where === "panel" ? this.manager_container : this.grid;
+        let parent = actor.get_parent();
+        if (parent !== target) {
+            if (parent) parent.remove_child(actor);
+            entry.icon.setOverflow(where === "overflow");
+            if (where === "panel") this.manager_container.add_actor(actor);
+            // overflow icons are attached by _layoutGrid()
+        }
+    }
+
+    _placeAll() {
+        for (let entry of Object.values(this.entries)) this._place(entry);
+        this._afterPlacementChange();
+    }
+
+    _afterPlacementChange() {
+        this._sortPanel();
+        this._layoutGrid();
+        this._refreshOpenLists();
+    }
+
+    _sortFunc(a, b) {
+        let asym = (a.proxy.icon_name || "").includes("-symbolic");
+        let bsym = (b.proxy.icon_name || "").includes("-symbolic");
+        if (asym && !bsym) return 1;
+        if (bsym && !asym) return -1;
+        return GLib.utf8_collate(this._displayName(a.id).toLowerCase(), this._displayName(b.id).toLowerCase());
+    }
+
+    _sortPanel() {
+        let inPanel = Object.values(this.entries).filter(e => e.icon && !e.icon.inOverflow);
+        inPanel.sort((a, b) => this._sortFunc(a, b));
+
+        this.manager_container.set_child_at_index(this._chevron, 0);
+        let i = 1;
+        for (let e of inPanel) this.manager_container.set_child_at_index(e.icon.actor, i++);
+        if (this._recorder) this.manager_container.set_child_at_index(this._recorder.actor, -1);
+    }
+
+    _overflowEntries() {
+        let list = Object.values(this.entries).filter(e => e.icon && e.icon.inOverflow);
+        list.sort((a, b) => GLib.utf8_collate(this._displayName(a.id).toLowerCase(), this._displayName(b.id).toLowerCase()));
+        return list;
+    }
+
+    _layoutGridLater() {
+        if (this._layoutId) return;
+        this._layoutId = Mainloop.idle_add(() => {
+            this._layoutId = 0;
+            this._layoutGrid();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _layoutGrid() {
+        if (!this.grid) return;
+        for (let child of this.grid.get_children()) this.grid.remove_child(child);
+
+        // Only visible icons get a slot, so there are no gaps.
+        let cols = Math.max(1, this.columns || 5);
+        let visible = this._overflowEntries().filter(e => e.icon.isVisible);
+        visible.forEach((e, i) => this.gridLayout.attach(e.icon.actor, i % cols, Math.floor(i / cols), 1, 1));
+
+        this.gridItem.actor.visible = visible.length > 0;
+        this.emptyItem.actor.visible = visible.length === 0;
+        this._chevronTooltip.set_text(ngettext("%d hidden icon", "%d hidden icons", visible.length).format(visible.length));
+        this._chevronCount.set_text(String(visible.length));
+        this._chevronCount.visible = !!this.showCount && visible.length > 0;
+    }
+
+    _refreshIcons() {
+        for (let entry of Object.values(this.entries)) {
+            if (entry.icon) entry.icon.refresh();
+        }
+        if (this._recorder) this._recorder.refresh();
+        this._setChevronIcon();
+    }
+
+    _setChevronIcon() {
+        let icon = this._chevronIcon;
+        let style = this.buttonIcon || "arrow";
+        let custom = (this.buttonCustomIcon || "").trim();
+
+        if (this.useCustomIcon && custom) {
+            let type = custom.match(/symbolic/) ? St.IconType.SYMBOLIC : St.IconType.FULLCOLOR;
+            icon.icon_type = type;
+            icon.gicon = custom.includes("/")
+                ? new Gio.FileIcon({ file: Gio.File.new_for_path(custom) })
+                : new Gio.ThemedIcon({ name: custom });
+            icon.icon_size = this.getPanelIconSize(type);
+            return;
+        }
+
+        icon.icon_type = St.IconType.SYMBOLIC;
+        icon.icon_size = this.getPanelIconSize(St.IconType.SYMBOLIC);
+
+        if (BUTTON_ICONS[style]) {
+            icon.gicon = Gio.ThemedIcon.new_from_names(BUTTON_ICONS[style]);
+            return;
+        }
+
+        // Arrow pointing to where the popup opens.
+        let name = "pan-up-symbolic";
+        switch (this.orientation) {
+            case St.Side.TOP: name = "pan-down-symbolic"; break;
+            case St.Side.LEFT: name = "pan-end-symbolic"; break;
+            case St.Side.RIGHT: name = "pan-start-symbolic"; break;
+        }
+        icon.icon_name = name;
+    }
+
+    /* ---------- open on hover, close when the pointer leaves ---------- */
+
+    _onChevronEnter() {
+        if (!this.openOnHover || this.menu.isOpen || global.settings.get_boolean("panel-edit-mode")) return;
+        this._cancelHoverOpen();
+        this._hoverId = Mainloop.timeout_add(Math.max(1, this.hoverDelay || 0), () => {
+            this._hoverId = 0;
+            if (this._chevron.hover && !this.menu.isOpen) this.menu.open(true);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _cancelHoverOpen() {
+        if (this._hoverId) {
+            Mainloop.source_remove(this._hoverId);
+            this._hoverId = 0;
+        }
+    }
+
+    _onOpenOnHoverChanged() {
+        this._cancelHoverOpen();
+        if (this.openOnHover && this.menu.isOpen) this._startLeaveWatch();
+        else this._stopLeaveWatch();
+    }
+
+    // While the popup is open in hover mode, close it once the pointer has
+    // been outside the popup and the button for a moment - but never while
+    // an app's menu (opened from the popup) is showing.
+    _startLeaveWatch() {
+        this._stopLeaveWatch();
+        let outsideSince = 0;
+        this._leaveId = Mainloop.timeout_add(150, () => {
+            if (!this.menu.isOpen || !this.openOnHover) {
+                this._leaveId = 0;
+                return GLib.SOURCE_REMOVE;
+            }
+            if (this._handoff) {
+                outsideSince = 0;
+                return GLib.SOURCE_CONTINUE;
+            }
+
+            let [px, py] = global.get_pointer();
+            let inside = this._pointerInsidePopup(px, py) || this._pointerInside(this._chevron, px, py);
+            let now = GLib.get_monotonic_time();
+
+            if (inside) {
+                outsideSince = 0;
+            } else if (!outsideSince) {
+                outsideSince = now;
+            } else if (now - outsideSince > Math.max(100, this.closeDelay || 500) * 1000) {
+                this._leaveId = 0;
+                this.closeOverflow();
+                return GLib.SOURCE_REMOVE;
             }
             return GLib.SOURCE_CONTINUE;
         });
-
-        this.signals.connect(Gtk.IconTheme.get_default(), "changed", this._refreshOverflowIcons, this);
-
-        // Registers our roles; this also makes the systray re-announce its
-        // legacy icons, so we learn their names.
-        this._applyRoles();
-        this._syncOverflow();
     }
 
-    on_applet_removed_from_panel() {
-        this._removed = true;
-        if (this._resolveId) {
-            Mainloop.source_remove(this._resolveId);
-            this._resolveId = 0;
+    _stopLeaveWatch() {
+        if (this._leaveId) {
+            Mainloop.source_remove(this._leaveId);
+            this._leaveId = 0;
         }
-        this._endHandOff();
-        if (this._layoutId) {
-            Mainloop.source_remove(this._layoutId);
-            this._layoutId = 0;
-        }
-        for (let n in this._attnTimers) this._cancelAttnTimer(n);
-        this._resetXappIcons();
-        if (this._applyId) {
-            Mainloop.source_remove(this._applyId);
-            this._applyId = 0;
-        }
-        this.signals.disconnectAllSignals();
-        this._appliedRoles = null;
-        try {
-            Main.systrayManager.unregisterTrayIconReplacement(this.uuid);
-        } catch (e) {
-            global.logError(e);
-        }
-        for (let key in this.xappIcons) {
-            if (this.xappIcons[key].overflow) this.xappIcons[key].overflow.destroy();
-        }
-        this.xappIcons = {};
-        this.legacyIcons = [];
-        if (this._pollId) {
-            Mainloop.source_remove(this._pollId);
-            this._pollId = 0;
-        }
-        this.monitorSignals.disconnectAllSignals();
-        this._hookedMonitor = null;
-        this._ownMonitor = null;
-        if (this.settings && this.settings.finalize) this.settings.finalize();
     }
 
-    on_orientation_changed(orientation) {
-        this.orientation = orientation;
-        this._setButtonIcon();
-        if (this.menu && this.menu.setOrientation) this.menu.setOrientation(orientation);
+    _onScaleChanged() {
+        if (this._scaleId) Mainloop.source_remove(this._scaleId);
+        this._scaleId = Mainloop.timeout_add(1500, () => {
+            this._scaleId = 0;
+            this._refreshIcons();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
-    on_applet_clicked(event) {
-        this.menu.toggle();
+    _onPanelEditModeChanged() {
+        let reactive = !global.settings.get_boolean("panel-edit-mode");
+        for (let entry of Object.values(this.entries)) {
+            if (entry.icon) entry.icon.actor.reactive = reactive;
+        }
     }
+
+    /* ---------- "show in panel when its icon changes" ---------- */
+
+    _freshRule(id, currentSig) {
+        let rule = { enabled: true, normal: [], ignore: [] };
+        let preset = PRESETS.find(p => p.match(id));
+        if (preset) {
+            rule.normal = preset.normal.slice();
+            rule.ignore = preset.ignore.slice();
+        } else if (currentSig) {
+            rule.normal.push(currentSig);   // whatever it looks like now is "normal"
+        }
+        return rule;
+    }
+
+    _entryFor(id) {
+        return Object.values(this.entries).find(e => e.id === id) || null;
+    }
+
+    async _currentSig(id) {
+        let entry = this._entryFor(id);
+        if (!entry) return null;
+        let sig = await iconSignature(entry.proxy.icon_name);
+        if (sig) entry.lastSig = sig;
+        return entry.lastSig;
+    }
+
+    async _setRuleEnabled(id, enabled) {
+        if (enabled) {
+            this._saveRule(id, this._freshRule(id, await this._currentSig(id)));
+        } else {
+            this._saveRule(id, null);
+            this._cancelAttnTimer(id);
+            this._setPopped(id, false);
+        }
+        this._evaluateId(id);
+        this._refreshOpenLists();
+    }
+
+    _markCurrent(id, kind) { // kind: "normal" | "ignore"
+        let rule = this._getRule(id);
+        let entry = this._entryFor(id);
+        let sig = entry ? entry.lastSig : null;
+        if (!rule || !sig) return;
+
+        rule.normal = rule.normal.filter(s => s !== sig);
+        rule.ignore = rule.ignore.filter(s => s !== sig);
+        rule[kind].push(sig);
+        this._saveRule(id, rule);
+
+        if (kind === "normal") {
+            this._cancelAttnTimer(id);
+            this._setPopped(id, false);
+        }
+    }
+
+    async _relearn(id) {
+        this._cancelAttnTimer(id);
+        this._setPopped(id, false);
+        this._saveRule(id, this._freshRule(id, await this._currentSig(id)));
+        this._refreshOpenLists();
+    }
+
+    _evaluateId(id) {
+        for (let entry of Object.values(this.entries)) {
+            if (entry.id === id) this._evaluateAttention(entry);
+        }
+    }
+
+    _evaluateAttention(entry) {
+        this._evaluateAttentionAsync(entry).catch(e => global.logError("Tray Overflow: " + e));
+    }
+
+    async _evaluateAttentionAsync(entry) {
+        if (!entry.settled) return;
+        let id = entry.id;
+        let rule = this._getRule(id);
+        if (!rule || !this._isHidden(id)) return;
+
+        let seq = ++entry.sigSeq;
+        let sig = await iconSignature(entry.proxy.icon_name);
+        if (this._removed || seq !== entry.sigSeq || this.entries[entry.key] !== entry || !sig) return;
+        entry.lastSig = sig;
+
+        // Rule enabled while the app wasn't running: learn the first look.
+        if (rule.normal.length === 0 && !rule.ignore.includes(sig)) {
+            rule.normal.push(sig);
+            this._saveRule(id, rule);
+        }
+
+        let want;
+        if (!entry.proxy.visible || rule.normal.includes(sig)) {
+            want = false;
+        } else if (rule.ignore.includes(sig)) {
+            this._cancelAttnTimer(id);   // in-between state: keep as is
+            return;
+        } else {
+            want = true;
+        }
+
+        this._cancelAttnTimer(id);
+        if (want === this._popped.has(id)) return;
+
+        let delay = Math.max(0, (want ? this.attentionDelayIn : this.attentionDelayOut) || 0) * 1000;
+        this._attnTimers[id] = Mainloop.timeout_add(Math.max(1, delay), () => {
+            delete this._attnTimers[id];
+            if (entry.lastSig === sig && this.entries[entry.key] === entry) this._setPopped(id, want);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _cancelAttnTimer(id) {
+        if (this._attnTimers[id]) {
+            Mainloop.source_remove(this._attnTimers[id]);
+            delete this._attnTimers[id];
+        }
+    }
+
+    _setPopped(id, popped) {
+        if (popped === this._popped.has(id)) return;
+        if (popped) this._popped.add(id);
+        else this._popped.delete(id);
+        this._log(id + (popped ? " -> panel (icon changed)" : " -> overflow (icon back to normal)"));
+        this._placeAll();
+    }
+
+    /* ---------- the popup stays open while an app's menu is shown ----------
+     * The popup holds the pointer while it's open, and an app can only show
+     * its menu once we let go. So on click we release the grab but keep the
+     * popup visible, then watch the app's menu:
+     *  - no menu within 700 ms -> it was an "open the app" click: close
+     *  - menu closed with the pointer still over the popup and no new
+     *    window focused (Esc, or a click back into the popup) -> grab again
+     *  - menu closed otherwise (item chosen, clicked elsewhere) -> close */
 
     closeOverflow() {
         this._endHandOff();
         this.menu.close(false);
     }
 
-    /* ---------- popup stays open while the app's menu is shown ----------
-     * Our popup is modal (holds the pointer). An app can only show its menu
-     * once we let go, so on click we drop the grab but keep the popup
-     * visible, then watch the app's menu:
-     *  - no menu within 700 ms      -> it was an "open app" click: close
-     *  - menu closed, pointer still over the popup and no new window
-     *    focused (Esc, or clicked back into the popup)  -> grab again, stay
-     *  - menu closed otherwise (item chosen, clicked elsewhere) -> close
-     */
     handOff(proxy) {
         this._endHandOff();
 
@@ -757,11 +1439,9 @@ class TrayOverflowApplet extends Applet.IconApplet {
             this.closeOverflow();
             return;
         }
-
         try {
             mgr._ungrab();
         } catch (e) {
-            global.logError("Tray Overflow: could not release grab: " + e);
             this.closeOverflow();
             return;
         }
@@ -779,7 +1459,6 @@ class TrayOverflowApplet extends Applet.IconApplet {
         this._handoff = h;
 
         const MENU_TYPES = [Meta.WindowType.DROPDOWN_MENU, Meta.WindowType.POPUP_MENU, Meta.WindowType.MENU];
-
         let sawMenu = () => {
             if (!h.menuSeen) {
                 h.menuSeen = true;
@@ -787,7 +1466,7 @@ class TrayOverflowApplet extends Applet.IconApplet {
             }
         };
 
-        // Any app menu shows up as a popup/dropdown window ...
+        // Any app menu shows up as a popup window ...
         h.sigs.connect(global.display, "window-created", (display, win) => {
             if (!MENU_TYPES.includes(win.get_window_type())) return;
             sawMenu();
@@ -797,13 +1476,11 @@ class TrayOverflowApplet extends Applet.IconApplet {
                 this._checkHandOffDone();
             });
         });
-
         // ... and XApp icons also report it as a property.
         h.sigs.connect(proxy, "g-properties-changed", () => {
             if (proxy.primary_menu_is_open || proxy.secondary_menu_is_open) sawMenu();
             this._checkHandOffDone();
         });
-
         h.sigs.connect(this.menu, "open-state-changed", (m, open) => {
             if (!open) this._endHandOff();
         });
@@ -813,7 +1490,6 @@ class TrayOverflowApplet extends Applet.IconApplet {
             if (this._handoff === h && !h.menuSeen) this.closeOverflow();
             return GLib.SOURCE_REMOVE;
         });
-
         h.maxTimer = Mainloop.timeout_add_seconds(120, () => {
             h.maxTimer = 0;
             if (this._handoff === h) this.closeOverflow();
@@ -825,16 +1501,15 @@ class TrayOverflowApplet extends Applet.IconApplet {
         let propOpen = false;
         try {
             propOpen = !!(h.proxy.primary_menu_is_open || h.proxy.secondary_menu_is_open);
-        } catch (e) { /* proxy gone */ }
+        } catch (e) { /* icon gone */ }
         return h.menuWindows.size > 0 || propOpen;
     }
 
     _checkHandOffDone() {
         let h = this._handoff;
-        if (!h || !h.menuSeen || h.doneTimer) return;
-        if (this._handOffMenuOpen(h)) return;
+        if (!h || !h.menuSeen || h.doneTimer || this._handOffMenuOpen(h)) return;
 
-        // Small delay: the window and the property don't change in a fixed order.
+        // The window and the property don't change in a fixed order.
         h.doneTimer = Mainloop.timeout_add(150, () => {
             h.doneTimer = 0;
             if (this._handoff !== h || this._handOffMenuOpen(h)) return GLib.SOURCE_REMOVE;
@@ -845,17 +1520,17 @@ class TrayOverflowApplet extends Applet.IconApplet {
             let inside = this._pointerInsidePopup(px, py);
 
             this._endHandOff();
-            if (focusChanged || !inside) {
-                this.closeOverflow();
-            } else {
-                this._regrab();
-            }
+            if (focusChanged || !inside) this.closeOverflow();
+            else this._regrab();
             return GLib.SOURCE_REMOVE;
         });
     }
 
     _pointerInsidePopup(px, py) {
-        let actor = this.menu.actor;
+        return this._pointerInside(this.menu.actor, px, py);
+    }
+
+    _pointerInside(actor, px, py) {
         if (!actor || !actor.visible) return false;
         let [ax, ay] = actor.get_transformed_position();
         let [aw, ah] = actor.get_transformed_size();
@@ -867,13 +1542,9 @@ class TrayOverflowApplet extends Applet.IconApplet {
         if (!this.menu.isOpen) return;
         try {
             if (!mgr.grabbed) mgr._grab();
-            if (mgr.grabbed) {
-                this.menu.actor.grab_key_focus();
-            } else {
-                this.menu.close(false);
-            }
+            if (mgr.grabbed) this.menu.actor.grab_key_focus();
+            else this.menu.close(false);
         } catch (e) {
-            global.logError("Tray Overflow: could not re-grab: " + e);
             this.menu.close(false);
         }
     }
@@ -892,753 +1563,6 @@ class TrayOverflowApplet extends Applet.IconApplet {
         h.menuWindows.clear();
     }
 
-    _setButtonIcon() {
-        let icon = "pan-up-symbolic";
-        switch (this.orientation) {
-            case St.Side.TOP: icon = "pan-down-symbolic"; break;
-            case St.Side.LEFT: icon = "pan-end-symbolic"; break;
-            case St.Side.RIGHT: icon = "pan-start-symbolic"; break;
-        }
-        this.set_applet_icon_symbolic_name(icon);
-    }
-
-    /* ---------- finding the icons (without a second monitor) ---------- */
-
-    _findStockApplet() {
-        try {
-            for (let a of AppletManager.getRunningInstancesForUuid(STOCK_UUID)) {
-                if (a && a.monitor) return a;
-            }
-        } catch (e) { /* ignore */ }
-        return null;
-    }
-
-    _hookMonitor() {
-        let stock = this._findStockApplet();
-        let monitor = null;
-
-        if (stock) {
-            this._noStockCount = 0;
-            monitor = stock.monitor;
-        } else {
-            // Only start our own monitor if the stock tray really isn't there
-            // (give it a few seconds at login).
-            this._noStockCount++;
-            if (this._noStockCount < 3 && !this._ownMonitor) return;
-            if (!this._ownMonitor) {
-                try {
-                    this._ownMonitor = new XApp.StatusIconMonitor();
-                    global.log("Tray Overflow: no XApp Status applet found, using own monitor");
-                } catch (e) {
-                    global.logError("Tray Overflow: could not start XApp.StatusIconMonitor: " + e);
-                    return;
-                }
-            }
-            monitor = this._ownMonitor;
-        }
-
-        if (monitor === this._hookedMonitor) return;
-
-        // Switch to the new monitor (first hook, stock applet reloaded, ...)
-        this.monitorSignals.disconnectAllSignals();
-        if (monitor !== this._ownMonitor) this._ownMonitor = null;
-        this._hookedMonitor = monitor;
-
-        this.monitorSignals.connect(monitor, "icon-added", (m, p) => {
-            try {
-                this._onIconAdded(m, p);
-            } catch (e) {
-                global.logError("Tray Overflow: icon-added failed: " + e);
-            }
-        });
-        this.monitorSignals.connect(monitor, "icon-removed", this._onIconRemoved, this);
-
-        this._resetXappIcons();
-        this._reconcile();
-        global.log("Tray Overflow: watching " + Object.keys(this.xappIcons).length + " tray icons");
-    }
-
-    /* Safety net: Mint's tray only re-checks its icons when the hide list
-     * changes, and it can miss some (e.g. nameless icons that were already
-     * in the panel at login). Fix any icon that ended up in the wrong place
-     * directly, using the stock applet's own methods. */
-    _enforceStock(stock, monitor) {
-        if (!stock || stock.monitor !== monitor) return;
-        if (typeof stock.removeStatusIcon !== "function" ||
-            typeof stock.ignoreStatusIcon !== "function" ||
-            typeof stock.addStatusIcon !== "function") return;
-
-        let roles = [];
-        try { roles = Main.systrayManager.getRoles(); } catch (e) { return; }
-
-        try {
-            // Should be hidden, but is still in the panel.
-            for (let k of Object.keys(stock.statusIcons || {})) {
-                let p = stock.statusIcons[k] && stock.statusIcons[k].proxy;
-                let e = p ? this.xappIcons[this._key(p)] : null;
-                if (!e || this._ownedByOtherApplet(e.role)) continue;
-                if (this._isEffectivelyHidden(e.name)) {
-                    global.log("Tray Overflow: hiding " + e.name + " directly (stock tray missed it)");
-                    stock.removeStatusIcon(p);
-                    stock.ignoreStatusIcon(p);
-                }
-            }
-
-            // Should be visible, but the stock tray still hides it - and
-            // nobody (no other applet) asks for it to be hidden.
-            for (let k of Object.keys(stock.ignoredProxies || {})) {
-                let p = stock.ignoredProxies[k];
-                let e = p ? this.xappIcons[this._key(p)] : null;
-                if (!e || this._isEffectivelyHidden(e.name)) continue;
-                if (roles.includes(e.role)) continue;
-                global.log("Tray Overflow: restoring " + e.name + " directly (stock tray missed it)");
-                delete stock.ignoredProxies[k];
-                stock.addStatusIcon(p);
-            }
-        } catch (e) {
-            global.logError("Tray Overflow: enforcing tray state failed: " + e);
-        }
-    }
-
-    /* Compare our icon list with what actually exists and fix differences.
-     * Runs on every poll, so an icon we missed (e.g. at login, while the
-     * stock applet was still starting) is picked up within 3 seconds. */
-    _reconcile() {
-        let monitor = this._hookedMonitor;
-        if (!monitor) return;
-
-        let present = new Map();
-        let complete = false;
-
-        // 1. The monitor's own list - the authoritative one.
-        try {
-            let list = monitor.list_icons() || [];
-            for (let p of list) {
-                if (p) present.set(this._key(p), p);
-            }
-            complete = true;
-        } catch (e) { /* older libxapp: fall back to the stock applet's lists */ }
-
-        // 2. What the stock applet shows or hides (same objects, covers gaps).
-        let stock = this._findStockApplet();
-        if (stock && stock.monitor === monitor) {
-            try {
-                for (let k in stock.statusIcons) {
-                    let p = stock.statusIcons[k] && stock.statusIcons[k].proxy;
-                    if (p) present.set(this._key(p), p);
-                }
-                for (let k in stock.ignoredProxies) {
-                    let p = stock.ignoredProxies[k];
-                    if (p) present.set(this._key(p), p);
-                }
-            } catch (e) { /* ignore */ }
-        }
-
-        let changed = false;
-
-        for (let [key, proxy] of present) {
-            if (this.xappIcons[key]) continue;
-            try {
-                this._onIconAdded(monitor, proxy);
-            } catch (e) {
-                global.logError("Tray Overflow: failed to add icon " + key + ": " + e);
-            }
-            changed = true;
-        }
-
-        // Only drop icons when we have a complete list to compare against.
-        if (complete && present.size > 0) {
-            for (let key of Object.keys(this.xappIcons)) {
-                if (present.has(key)) continue;
-                try {
-                    this._onIconRemoved(monitor, this.xappIcons[key].proxy);
-                } catch (e) {
-                    global.logError("Tray Overflow: failed to remove icon " + key + ": " + e);
-                }
-                changed = true;
-            }
-        }
-
-        this._enforceStock(stock, monitor);
-
-        if (!this._purged && present.size > 0) {
-            this._purged = true;
-            this._purgeStaleIds();
-        }
-
-        if (changed) this._syncOverflow();
-    }
-
-    _disconnectEntry(entry) {
-        if (entry.propsId) {
-            try { entry.proxy.disconnect(entry.propsId); } catch (e) { /* ignore */ }
-            entry.propsId = 0;
-        }
-    }
-
-    _resetXappIcons() {
-        for (let key in this.xappIcons) {
-            this._disconnectEntry(this.xappIcons[key]);
-            let ov = this.xappIcons[key].overflow;
-            if (ov) {
-                if (ov.actor.get_parent()) this.grid.remove_child(ov.actor);
-                ov.destroy();
-            }
-        }
-        this.xappIcons = {};
-    }
-
-    /* ---------- "show in panel when its icon changes" ---------- */
-
-    _getRules() {
-        let r = this.settings.getValue("attention-rules");
-        return (r && typeof r === "object" && !Array.isArray(r)) ? JSON.parse(JSON.stringify(r)) : {};
-    }
-
-    _getRule(name) {
-        let r = this._getRules()[name];
-        return (r && r.enabled) ? r : null;
-    }
-
-    _saveRule(name, rule) {
-        let rules = this._getRules();
-        if (rule) rules[name] = rule;
-        else delete rules[name];
-        this.settings.setValue("attention-rules", rules);
-    }
-
-    _currentSig(name) {
-        for (let key in this.xappIcons) {
-            let e = this.xappIcons[key];
-            if (e.name === name) {
-                e.lastSig = iconSignature(e.proxy) || e.lastSig;
-                if (e.lastSig) return e.lastSig;
-            }
-        }
-        return null;
-    }
-
-    _freshRule(name) {
-        let rule = { enabled: true, normal: [], ignore: [] };
-        let preset = PRESETS.find(p => p.match(name));
-        if (preset) {
-            rule.normal = preset.normal.slice();
-            rule.ignore = preset.ignore.slice();
-        } else {
-            // Whatever it looks like right now counts as "normal".
-            let sig = this._currentSig(name);
-            if (sig) rule.normal.push(sig);
-        }
-        return rule;
-    }
-
-    _setRuleEnabled(name, enabled) {
-        if (enabled) {
-            this._saveRule(name, this._freshRule(name));
-        } else {
-            this._saveRule(name, null);
-            this._cancelAttnTimer(name);
-            if (this._popped.delete(name)) {
-                this._applyRoles();
-                this._syncOverflow();
-            }
-        }
-        this._evaluateName(name);
-    }
-
-    _markCurrent(name, kind) { // kind: "normal" | "ignore"
-        let rule = this._getRule(name);
-        let sig = this._currentSig(name);
-        if (!rule || !sig) return;
-        rule.normal = rule.normal.filter(s => s !== sig);
-        rule.ignore = rule.ignore.filter(s => s !== sig);
-        rule[kind].push(sig);
-        this._saveRule(name, rule);
-
-        if (kind === "normal") {
-            this._cancelAttnTimer(name);
-            this._setPopped(name, false);
-        }
-    }
-
-    _relearn(name) {
-        this._cancelAttnTimer(name);
-        this._setPopped(name, false);
-        this._saveRule(name, this._freshRule(name));
-    }
-
-    _evaluateName(name) {
-        for (let key in this.xappIcons) {
-            if (this.xappIcons[key].name === name) this._evaluateAttention(this.xappIcons[key]);
-        }
-    }
-
-    _evaluateAttention(entry) {
-        let name = entry.name;
-        if (!name) return;
-
-        let rule = this._getRule(name);
-        if (!rule || !this._isHidden(name)) return;
-
-        let visible = true;
-        try { visible = !!entry.proxy.visible; } catch (e) { /* ignore */ }
-
-        let sig = iconSignature(entry.proxy);
-        if (!sig) return;
-        entry.lastSig = sig;
-
-        // Never seen a normal look yet (rule enabled while the app was
-        // closed): learn the first one.
-        if (rule.normal.length === 0 && !rule.ignore.includes(sig)) {
-            rule.normal.push(sig);
-            this._saveRule(name, rule);
-        }
-
-        let want;
-        if (!visible || rule.normal.includes(sig)) {
-            want = false;
-        } else if (rule.ignore.includes(sig)) {
-            this._cancelAttnTimer(name);   // in-between state: keep as is
-            return;
-        } else {
-            want = true;
-        }
-
-        if (want === this._popped.has(name)) {
-            this._cancelAttnTimer(name);
-            return;
-        }
-
-        this._cancelAttnTimer(name);
-        let delay = Math.max(0, (want ? this.attentionDelayIn : this.attentionDelayOut) || 0) * 1000;
-        this._attnTimers[name] = Mainloop.timeout_add(Math.max(1, delay), () => {
-            delete this._attnTimers[name];
-            // Still the same look after the delay?
-            if (entry.lastSig === sig && this.xappIcons[this._key(entry.proxy)] === entry) {
-                this._setPopped(name, want);
-            }
-            return GLib.SOURCE_REMOVE;
-        });
-    }
-
-    _cancelAttnTimer(name) {
-        if (this._attnTimers[name]) {
-            Mainloop.source_remove(this._attnTimers[name]);
-            delete this._attnTimers[name];
-        }
-    }
-
-    _setPopped(name, popped) {
-        if (popped === this._popped.has(name)) return;
-        if (popped) this._popped.add(name);
-        else this._popped.delete(name);
-        global.log("Tray Overflow: " + name + (popped ? " -> panel (icon changed)" : " -> overflow (icon back to normal)"));
-        this._applyRoles();
-        this._syncOverflow();
-    }
-
-    /* ---------- XApp icons ---------- */
-
-    _key(proxy) {
-        return proxy.get_name() + proxy.get_object_path();
-    }
-
-    _onIconAdded(monitor, proxy) {
-        let key = this._key(proxy);
-        if (this.xappIcons[key]) return;
-
-        // role: what the stock tray matches on (changes for some apps)
-        // name: our stable id, used for every saved setting
-        let role = (proxy.name || "").toLowerCase();
-        let name = stableId(proxy.name);
-        if (!name) {
-            // Some apps register their tray icon without any name. Mint's tray
-            // can only treat all of those alike, so they share one entry
-            // (labelled with the tooltip in the list).
-            name = "untitled";
-        }
-        global.log("Tray Overflow: found tray icon name=\"" + (proxy.name || "") + "\" id=\"" + name +
-                   "\" tooltip=\"" + plainText(proxy.tooltip_text) + "\"");
-        let entry = { proxy: proxy, name: name, role: role, overflow: null, lastSig: null, propsId: 0,
-                      progId: isProgramId(name) ? name : null, resolveTried: false };
-        this.xappIcons[key] = entry;
-        if (name !== role) this._migrateId(role, name);
-        if (name.startsWith("flatpak:")) this._inheritShared(name, proxy);
-
-        entry.propsId = proxy.connect("g-properties-changed", (p, changed) => {
-            let props = {};
-            try { props = changed.deep_unpack(); } catch (e) { /* ignore */ }
-            if ("Name" in props) this._onNameChanged(entry);
-            if ("IconName" in props || "Visible" in props) this._evaluateAttention(entry);
-        });
-
-        this._maybeAutoHide(name);
-        this._applyRoles();
-        this._evaluateAttention(entry);
-        this._syncOverflow();
-        this._refreshOpenLists();
-        if (entry.progId) this._adoptId(entry, entry.progId);   // merge old duplicates
-        else this._scheduleResolve();
-    }
-
-    /* ---------- identify relayed tray icons by their program ---------- */
-
-    _scheduleResolve() {
-        if (this._resolveId) return;
-        this._resolveId = Mainloop.timeout_add(400, () => {
-            this._resolveId = 0;
-            this._resolvePrograms().catch(e => global.logError("Tray Overflow: resolve failed: " + e));
-            return GLib.SOURCE_REMOVE;
-        });
-    }
-
-    async _resolvePrograms() {
-        let pending = Object.values(this.xappIcons).filter(e => !e.progId && !e.resolveTried);
-        if (pending.length === 0) return;
-
-        let map = await buildTrayProgramMap();
-        if (!map || this._removed) return;
-
-        for (let e of pending) {
-            if (this.xappIcons[this._key(e.proxy)] !== e) continue;   // gone meanwhile
-            let prog = map.get(sortableName(e.proxy.name || ""));
-            if (prog) {
-                this._adoptId(e, prog);
-            } else {
-                e.resolveTried = true;   // native XApp icon (e.g. Mint Update): its name is stable
-            }
-        }
-    }
-
-    /* Switch an icon to its program id and fold every older entry of the
-     * same app (earlier names, duplicates from older versions) into it. */
-    _adoptId(entry, newId) {
-        entry.progId = newId;
-        if (entry.name === newId && !this._needsMerge(entry, newId)) return;
-
-        let oldId = entry.name;
-        let labels = new Set([prettyName(newId), prettyName(entry.role), entry.role, prettyName(oldId)]);
-        let inUse = new Set(Object.values(this.xappIcons).filter(e => e !== entry).map(e => e.name));
-        let known = new Set([].concat(this._getList("hidden-list"), this._getList("shown-list"),
-                                      Object.keys(this._getRules())));
-        let candidates = [oldId].concat(Array.from(known).filter(id =>
-            id !== oldId && id !== newId && !inUse.has(id) && labels.has(prettyName(id))));
-        candidates = candidates.filter(id => id !== newId && !inUse.has(id) && id !== "untitled");
-
-        // The entry you currently see (and switch) in the list wins; other
-        // leftovers only fill in what's missing.
-        if (oldId !== newId && this._hasSettings(oldId)) this._mergeInto(oldId, newId);
-        for (let id of candidates) {
-            if (id !== oldId && this._hasSettings(id)) this._mergeInto(id, newId, true);
-        }
-        for (let id of candidates) this._forgetId(id);
-
-        if (oldId !== newId) {
-            this._cancelAttnTimer(oldId);
-            this._popped.delete(oldId);
-            entry.name = newId;
-            global.log("Tray Overflow: " + entry.role + " is " + newId +
-                       (candidates.length ? " (merged: " + candidates.join(", ") + ")" : ""));
-        }
-        this._refreshOpenLists();
-
-        this._applyRoles();
-        this._syncOverflow();
-        this._evaluateAttention(entry);
-    }
-
-    // Copy settings of one id onto another. Without onlyMissing, panel/hidden
-    // and the "icon changes" rule of `from` replace those of `to`.
-    _mergeInto(from, to, onlyMissing) {
-        let hidden = this._getList("hidden-list");
-        let shown = this._getList("shown-list");
-        let rules = this._getRules();
-
-        let toHasState = hidden.includes(to) || shown.includes(to);
-        if ((hidden.includes(from) || shown.includes(from)) && !(onlyMissing && toHasState)) {
-            let target = hidden.includes(from) ? "hidden" : "shown";
-            hidden = hidden.filter(n => n !== to);
-            shown = shown.filter(n => n !== to);
-            (target === "hidden" ? hidden : shown).push(to);
-            this.settings.setValue("hidden-list", hidden);
-            this.settings.setValue("shown-list", shown);
-        }
-        if (rules[from] && !(onlyMissing && rules[to])) {
-            rules[to] = JSON.parse(JSON.stringify(rules[from]));
-            this.settings.setValue("attention-rules", rules);
-        }
-    }
-
-    _needsMerge(entry, id) {
-        let label = prettyName(id);
-        let inUse = new Set(Object.values(this.xappIcons).filter(e => e !== entry).map(e => e.name));
-        let known = [].concat(this._getList("hidden-list"), this._getList("shown-list"), Object.keys(this._getRules()));
-        return known.some(k => k !== id && !inUse.has(k) && (prettyName(k) === label || k === entry.role));
-    }
-
-    /* Some apps (e.g. LastWave) create their tray icon first and set its
-     * name a moment later. Follow the change so the icon ends up under its
-     * real name, with the settings it had under the old one. */
-    _onNameChanged(entry) {
-        let role = (entry.proxy.name || "").toLowerCase();
-        if (role === entry.role) return;
-
-        if (entry.progId) {
-            // Identified by its program: only the name the stock tray uses
-            // changes. Old entries saved under this new name are merged.
-            entry.role = role;
-            this._adoptId(entry, entry.progId);
-            this._applyRoles();
-            this._syncOverflow();
-            return;
-        }
-
-        let oldId = entry.name;
-        let id = stableId(entry.proxy.name) || "untitled";
-        global.log("Tray Overflow: icon renamed \"" + entry.role + "\" -> \"" + role + "\" (id " + id + ")");
-        entry.role = role;
-
-        if (id !== oldId) {
-            this._cancelAttnTimer(oldId);
-            this._popped.delete(oldId);
-            entry.name = id;
-
-            // Name was a connection id -> we now know the program. Keep that
-            // id through any later renames (tray id, title ...).
-            if (isProgramId(id)) {
-                entry.progId = null;
-                this._adoptId(entry, id);   // sets progId and merges old duplicates
-            }
-
-            // "untitled" is the shared start-up state of every relayed icon,
-            // not a real app: never move or delete its setting.
-            if (oldId !== "untitled") {
-                if (!this._hasSettings(id)) this._copySettings(oldId, id);
-                if (!Object.values(this.xappIcons).some(e => e !== entry && e.name === oldId)) {
-                    this._forgetId(oldId);
-                }
-            }
-        }
-
-        this._applyRoles();
-        this._syncOverflow();
-        this._evaluateAttention(entry);
-        this._refreshOpenLists();
-        if (!entry.progId) {
-            entry.resolveTried = false;
-            this._scheduleResolve();
-        }
-    }
-
-    _forgetId(id) {
-        for (let key of ["hidden-list", "shown-list"]) {
-            let list = this._getList(key);
-            if (list.includes(id)) this.settings.setValue(key, list.filter(n => n !== id));
-        }
-        let rules = this._getRules();
-        if (rules[id]) {
-            delete rules[id];
-            this.settings.setValue("attention-rules", rules);
-        }
-        this._cancelAttnTimer(id);
-        this._popped.delete(id);
-    }
-
-    _hasSettings(id) {
-        return this._getList("hidden-list").includes(id) ||
-               this._getList("shown-list").includes(id) ||
-               !!this._getRules()[id];
-    }
-
-    _copySettings(fromId, toId) {
-        for (let key of ["hidden-list", "shown-list"]) {
-            let list = this._getList(key);
-            if (list.includes(fromId) && !list.includes(toId)) {
-                list.push(toId);
-                this.settings.setValue(key, list);
-            }
-        }
-        let rules = this._getRules();
-        if (rules[fromId] && !rules[toId]) {
-            rules[toId] = JSON.parse(JSON.stringify(rules[fromId]));
-            this.settings.setValue("attention-rules", rules);
-        }
-    }
-
-    // Settings saved under an old temporary name -> move to the stable id.
-    _migrateId(oldId, newId) {
-        for (let key of ["hidden-list", "shown-list"]) {
-            let list = this._getList(key);
-            if (list.includes(oldId)) {
-                list = list.filter(n => n !== oldId && n !== newId);
-                list.push(newId);
-                this.settings.setValue(key, list);
-            }
-        }
-        let rules = this._getRules();
-        if (rules[oldId]) {
-            if (!rules[newId]) rules[newId] = rules[oldId];
-            delete rules[oldId];
-            this.settings.setValue("attention-rules", rules);
-        }
-    }
-
-    // A Flatpak app seen for the first time with its own id takes over the
-    // settings of the old shared "xdg-dbus-proxy" entry. The "icon changes"
-    // rule only goes to the app whose current look it learned (Vesktop).
-    _inheritShared(id, proxy) {
-        let hidden = this._getList("hidden-list");
-        let shown = this._getList("shown-list");
-        let rules = this._getRules();
-        if (hidden.includes(id) || shown.includes(id) || rules[id]) return;
-
-        let old = SHARED_IDS.find(o => hidden.includes(o) || shown.includes(o) || rules[o]);
-        if (!old) return;
-
-        if (hidden.includes(old)) {
-            hidden.push(id);
-            this.settings.setValue("hidden-list", hidden);
-        } else if (shown.includes(old)) {
-            shown.push(id);
-            this.settings.setValue("shown-list", shown);
-        }
-
-        let rule = rules[old];
-        if (rule && rule.enabled) {
-            let sig = iconSignature(proxy);
-            if (sig && rule.normal.includes(sig)) {
-                rules[id] = JSON.parse(JSON.stringify(rule));
-                delete rules[old];
-                this.settings.setValue("attention-rules", rules);
-            }
-        }
-    }
-
-    // Temporary names that belong to no running app can never match again.
-    _purgeStaleIds() {
-        // Leftovers from 1.10: "app:cryptomator" next to "cryptomator".
-        let known = new Set([].concat(this._getList("hidden-list"), this._getList("shown-list"),
-                                      Object.keys(this._getRules())));
-        let running = new Set(Object.values(this.xappIcons).map(e => e.name));
-        for (let id of known) {
-            let m = id.match(/^(app|flatpak):(.+)$/);
-            if (!m || running.has(id)) continue;
-            let plain = m[2];
-            if (known.has(plain) || running.has(plain)) {
-                if (!this._hasSettings(plain)) this._copySettings(id, plain);
-                this._forgetId(id);
-            }
-        }
-
-        let current = new Set(Object.values(this.xappIcons).map(e => e.role));
-        for (let key of ["hidden-list", "shown-list"]) {
-            let list = this._getList(key);
-            let kept = list.filter(n => !isUnstableId(n) || current.has(n));
-            if (kept.length !== list.length) this.settings.setValue(key, kept);
-        }
-        let rules = this._getRules();
-        let changed = false;
-        for (let n in rules) {
-            if (isUnstableId(n) && !current.has(n)) {
-                delete rules[n];
-                changed = true;
-            }
-        }
-        if (changed) this.settings.setValue("attention-rules", rules);
-    }
-
-    _onIconRemoved(monitor, proxy) {
-        let key = this._key(proxy);
-        let entry = this.xappIcons[key];
-        if (!entry) return;
-
-        if (entry.overflow) {
-            if (entry.overflow.actor.get_parent()) this.grid.remove_child(entry.overflow.actor);
-            entry.overflow.destroy();
-        }
-        this._disconnectEntry(entry);
-        delete this.xappIcons[key];
-        this._refreshOpenLists();
-
-        // App quit: forget that it was moved into the panel.
-        if (!Object.values(this.xappIcons).some(e => e.name === entry.name)) {
-            this._cancelAttnTimer(entry.name);
-            if (this._popped.delete(entry.name)) this._applyRoles();
-        }
-        this._syncOverflow();
-    }
-
-    _syncOverflow() {
-        for (let key in this.xappIcons) {
-            let entry = this.xappIcons[key];
-            let want = entry.name && this._isEffectivelyHidden(entry.name) && !this._ownedByOtherApplet(entry.role);
-
-            if (want && !entry.overflow) {
-                entry.overflow = new OverflowIcon(this, entry.proxy);
-                // An app hiding/showing its icon changes the grid: re-pack it
-                // so no empty slot is left behind.
-                entry.overflow.actor.connect("notify::visible", () => this._layoutGridLater());
-            } else if (!want && entry.overflow) {
-                if (entry.overflow.actor.get_parent()) this.grid.remove_child(entry.overflow.actor);
-                entry.overflow.destroy();
-                entry.overflow = null;
-            }
-        }
-        this._layoutGrid();
-    }
-
-    _refreshOverflowIcons() {
-        for (let key in this.xappIcons) {
-            if (this.xappIcons[key].overflow) this.xappIcons[key].overflow.refresh();
-        }
-    }
-
-    _overflowIcons() {
-        let list = [];
-        for (let key in this.xappIcons) {
-            if (this.xappIcons[key].overflow) list.push(this.xappIcons[key].overflow);
-        }
-        list.sort((a, b) => GLib.utf8_collate(a.sortName, b.sortName));
-        return list;
-    }
-
-    _layoutGrid() {
-        if (!this.grid) return;
-
-        for (let child of this.grid.get_children()) {
-            this.grid.remove_child(child);
-        }
-
-        let cols = Math.max(1, this.columns || 5);
-        let i = 0;
-        for (let icon of this._overflowIcons().filter(ic => ic.isVisible)) {
-            this.gridLayout.attach(icon.actor, i % cols, Math.floor(i / cols), 1, 1);
-            i++;
-        }
-        this._updateEmptyState();
-    }
-
-    _layoutGridLater() {
-        if (this._layoutId) return;
-        this._layoutId = Mainloop.idle_add(() => {
-            this._layoutId = 0;
-            this._layoutGrid();
-            return GLib.SOURCE_REMOVE;
-        });
-    }
-
-    _updateEmptyState() {
-        let visibleCount = this._overflowIcons().filter(i => i.isVisible).length;
-        let legacyHidden = this._knownEntries().filter(e => e.kind === "legacy" && this._isEffectivelyHidden(e.name) && e.running).length;
-
-        this.gridItem.actor.visible = visibleCount > 0;
-        this.emptyItem.actor.visible = visibleCount === 0;
-
-        let tip = visibleCount === 1 ? "1 hidden icon" : visibleCount + " hidden icons";
-        if (legacyHidden > 0) tip += " (+" + legacyHidden + " legacy hidden completely)";
-        this.set_applet_tooltip(tip);
-    }
-
     /* ---------- menus ---------- */
 
     _buildMenus() {
@@ -1646,68 +1570,61 @@ class TrayOverflowApplet extends Applet.IconApplet {
         this.menu = new Applet.AppletPopupMenu(this, this.orientation);
         this.menuManager.addMenu(this.menu);
 
-        // Icon grid
+        // Shown when the stock tray is on the panel too (icons would appear twice).
+        this.noticeItem = new PopupMenu.PopupMenuItem(_("Remove the XApp Status Applet from the panel"), { reactive: false });
+        this.noticeItem.actor.visible = false;
+        this.menu.addMenuItem(this.noticeItem);
+
         this.gridLayout = new Clutter.GridLayout({ column_spacing: 2, row_spacing: 2 });
-        this.grid = new St.Widget({ layout_manager: this.gridLayout });
+        this.grid = new St.Widget({ layout_manager: this.gridLayout, x_expand: false, x_align: Clutter.ActorAlign.START });
         this.gridItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, activate: false, hover: false });
-        this.gridItem.addActor(this.grid, { span: -1, expand: true });
+        this.gridItem.addActor(this.grid, { span: -1, expand: false });
         this.menu.addMenuItem(this.gridItem);
 
-        this.emptyItem = new PopupMenu.PopupMenuItem("No hidden icons", { reactive: false });
+        this.emptyItem = new PopupMenu.PopupMenuItem(_("No hidden icons"), { reactive: false });
         this.menu.addMenuItem(this.emptyItem);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        // "Which icons appear in the panel" - in the popup ...
-        this.manageItem = new PopupMenu.PopupSubMenuMenuItem("Icons shown in the panel");
+        this.manageItem = new PopupMenu.PopupSubMenuMenuItem(_("Icons shown in the panel"));
         this.menu.addMenuItem(this.manageItem);
         this.menu.connect("open-state-changed", (m, open) => {
-            if (open) {
-                this._fillManageMenu(this.manageItem.menu);
-                this._updateEmptyState();
+            this._cancelHoverOpen();
+            if (!open) {
+                this._stopLeaveWatch();
+                return;
             }
+            if (this.openOnHover) this._startLeaveWatch();
+            this.noticeItem.actor.visible = this._stockTrayRunning();
+            this._fillManageMenu(this.manageItem.menu);
         });
 
-        // ... and in the right-click menu.
-        this.ctxManageItem = new PopupMenu.PopupSubMenuMenuItem("Icons shown in the panel");
+        this.ctxManageItem = new PopupMenu.PopupSubMenuMenuItem(_("Icons shown in the panel"));
         this._applet_context_menu.addMenuItem(this.ctxManageItem, 0);
         this._applet_context_menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem(), 1);
         this._applet_context_menu.connect("open-state-changed", (m, open) => {
             if (open) this._fillManageMenu(this.ctxManageItem.menu);
         });
+
+        this._layoutGrid();
     }
 
-    _knownEntries() {
-        let byName = {};
-
-        for (let key in this.xappIcons) {
-            let e = this.xappIcons[key];
-            if (!e.name || this._ownedByOtherApplet(e.role)) continue;
-            let tip = plainText(e.proxy.tooltip_text);
-            let pretty = prettyName(e.name);
-            let label = pretty;
-            if (tip && tip.toLowerCase() !== pretty.toLowerCase()) label += " — " + tip;
-            byName[e.name] = { name: e.name, label: truncate(label, 55), kind: "xapp", running: true };
+    _stockTrayRunning() {
+        try {
+            return AppletManager.getRunningInstancesForUuid(STOCK_TRAY_UUID).length > 0;
+        } catch (e) {
+            return false;
         }
+    }
 
-        for (let e of this.legacyIcons) {
-            if (!e.role || byName[e.role] || this._ownedByOtherApplet(e.role)) continue;
-            byName[e.role] = { name: e.role, label: e.role, kind: "legacy", running: true };
-        }
-
-        // Hidden apps that aren't running right now - keep them listed so
-        // they can be un-hidden.
-        for (let n of this._getList("hidden-list")) {
-            if (!byName[n] && !isUnstableId(n) && !SHARED_IDS.includes(n) && n !== "untitled") byName[n] = { name: n, label: truncate(prettyName(n), 55), kind: "unknown", running: false };
-        }
-
-        return Object.values(byName).sort((a, b) => GLib.utf8_collate(a.label.toLowerCase(), b.label.toLowerCase()));
+    on_applet_clicked(event) {
+        this.menu.toggle();
     }
 
     // Rebuild the icon list(s) if they are open right now.
     _refreshOpenLists() {
         for (let item of [this.manageItem, this.ctxManageItem]) {
-            if (item && item.menu && item.menu.isOpen) this._refillLater(item.menu, null);
+            if (item && item.menu.isOpen) this._refillLater(item.menu, null);
         }
     }
 
@@ -1715,58 +1632,80 @@ class TrayOverflowApplet extends Applet.IconApplet {
         // Rebuild after the click has finished. The clicked item is about to
         // be destroyed; if it still had key focus, Cinnamon would treat that
         // as "focus left the menu" and close it - so park focus first.
-        Mainloop.idle_add(() => {
+        if (this._refillIds && this._refillIds.has(subMenu)) return;
+        if (!this._refillIds) this._refillIds = new Map();
+
+        let id = Mainloop.idle_add(() => {
+            this._refillIds.delete(subMenu);
             if (!subMenu.isOpen) return GLib.SOURCE_REMOVE;
             if (subMenu.sourceActor) subMenu.sourceActor.grab_key_focus();
             this._fillManageMenu(subMenu, focusKey);
             return GLib.SOURCE_REMOVE;
         });
+        this._refillIds.set(subMenu, id);
     }
 
-    _addAttentionItems(subMenu, e, mainItem, items) {
-        let rule = this._getRule(e.name);
-        let popped = this._popped.has(e.name);
+    _knownEntries() {
+        let byId = {};
 
-        if (popped) mainItem.setStatus("icon changed");
-
-        if (!e.running) {
-            let forget = new ActionItem("      ↳ Forget this app (remove from the list)");
-            forget.connect("activate", () => {
-                this._forgetId(e.name);
-                this._applyRoles();
-                this._syncOverflow();
-                this._refillLater(subMenu, null);
-            });
-            subMenu.addMenuItem(forget);
-            items[e.name + "#forget"] = forget;
-            if (!rule) return;      // keep the list short for apps that aren't running
+        for (let e of Object.values(this.entries)) {
+            if (!e.settled || this._ignoredByOtherApplet(e)) continue;
+            let name = this._displayName(e.id);
+            let tip = plainText(e.proxy.tooltip_text);
+            let label = name;
+            if (tip && !name.toLowerCase().includes(tip.toLowerCase()) && !tip.toLowerCase().includes(name.toLowerCase())) {
+                label += " — " + tip;
+            }
+            byId[e.id] = { id: e.id, label: truncate(label, 55), running: true };
         }
 
-        let sw = new ToggleItem("      ↳ Show in panel when its icon changes", !!rule, "On", "Off");
-        sw.connect("toggled", (it, state) => {
-            this._setRuleEnabled(e.name, state);
-            this._refillLater(subMenu, e.name + "#rule");
-        });
-        subMenu.addMenuItem(sw);
-        items[e.name + "#rule"] = sw;
+        // Hidden apps that aren't running - keep them listed so they can be
+        // shown again or forgotten.
+        for (let id of this._getList("hidden-list")) {
+            if (!byId[id] && id !== UNTITLED && !isUnstableName(id)) {
+                byId[id] = { id: id, label: truncate(this._displayName(id), 55), running: false };
+            }
+        }
 
-        if (!rule) return;
+        return Object.values(byId).sort((a, b) => GLib.utf8_collate(a.label.toLowerCase(), b.label.toLowerCase()));
+    }
+
+    _addAppOptions(subMenu, e, mainItem, items) {
+        let rule = this._getRule(e.id);
+        let popped = this._popped.has(e.id);
+        if (popped) mainItem.setStatus(_("icon changed"));
 
         let action = (text, key, fn) => {
             let it = new ActionItem("      ↳ " + text);
             it.connect("activate", () => {
                 fn();
-                this._refillLater(subMenu, e.name + "#rule");
+                this._refillLater(subMenu, e.id + key);
             });
             subMenu.addMenuItem(it);
-            items[e.name + key] = it;
+            items[e.id + key] = it;
         };
 
+        if (!e.running) {
+            action(_("Forget this app (remove from the list)"), "#forget", () => this._forgetId(e.id));
+            if (!rule) return;      // keep the list short for apps that aren't running
+        }
+
+        let sw = new ToggleItem("      ↳ " + _("Show in panel when its icon changes"), !!rule, _("On"), _("Off"));
+        sw.connect("toggled", (it, state) => {
+            this._setRuleEnabled(e.id, state).catch(err => global.logError("Tray Overflow: " + err));
+            this._refillLater(subMenu, e.id + "#rule");
+        });
+        subMenu.addMenuItem(sw);
+        items[e.id + "#rule"] = sw;
+
+        if (!rule) return;
+
         if (popped) {
-            action("This look is normal (hide it again)", "#normal", () => this._markCurrent(e.name, "normal"));
-            action("Ignore this look (in-between state)", "#ignore", () => this._markCurrent(e.name, "ignore"));
+            action(_("This look is normal (hide it again)"), "#normal", () => this._markCurrent(e.id, "normal"));
+            action(_("Ignore this look (in-between state)"), "#ignore", () => this._markCurrent(e.id, "ignore"));
         } else if (e.running) {
-            action("Re-learn: current look is normal", "#relearn", () => this._relearn(e.name));
+            action(_("Re-learn: current look is normal"), "#relearn",
+                   () => this._relearn(e.id).catch(err => global.logError("Tray Overflow: " + err)));
         }
     }
 
@@ -1776,70 +1715,97 @@ class TrayOverflowApplet extends Applet.IconApplet {
 
         let entries = this._knownEntries();
         if (entries.length === 0) {
-            subMenu.addMenuItem(new PopupMenu.PopupMenuItem("No tray icons found", { reactive: false }));
+            subMenu.addMenuItem(new PopupMenu.PopupMenuItem(_("No tray icons found"), { reactive: false }));
             return;
         }
 
         for (let e of entries) {
-            let item = new ToggleItem(e.label, !this._isHidden(e.name), "Panel", "Hidden");
-            let status = [];
-            if (e.kind === "legacy") status.push("legacy: hides completely");
-            if (!e.running) status.push("not running");
-            if (status.length) item.setStatus(status.join(", "));
-
+            let item = new ToggleItem(e.label, !this._isHidden(e.id), _("Panel"), _("Hidden"));
+            if (!e.running) item.setStatus(_("not running"));
             item.connect("toggled", (it, state) => {
-                this._setHidden(e.name, !state);
-                this._refillLater(subMenu, e.name);
+                this._setHidden(e.id, !state);
+                this._refillLater(subMenu, e.id);
             });
             subMenu.addMenuItem(item);
-            items[e.name] = item;
+            items[e.id] = item;
 
-            if (e.kind !== "legacy" && this._isHidden(e.name)) {
-                this._addAttentionItems(subMenu, e, item, items);
-            }
+            if (this._isHidden(e.id)) this._addAppOptions(subMenu, e, item, items);
         }
 
         subMenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        let showAll = new ActionItem("Show all in panel");
-        showAll.connect("activate", () => {
-            this.on_show_all_clicked();
-            this._refillLater(subMenu, "#showall");
-        });
-        subMenu.addMenuItem(showAll);
-        items["#showall"] = showAll;
+        let addAction = (text, key, fn) => {
+            let it = new ActionItem(text);
+            it.connect("activate", () => {
+                fn();
+                this._refillLater(subMenu, key);
+            });
+            subMenu.addMenuItem(it);
+            items[key] = it;
+        };
+
+        addAction(_("Show all in panel"), "#showall", () => this.on_show_all_clicked());
 
         if (entries.some(e => !e.running)) {
-            let forgetAll = new ActionItem("Forget all apps that aren't running");
-            forgetAll.connect("activate", () => {
+            addAction(_("Forget all apps that aren't running"), "#forgetall", () => {
                 for (let e of entries) {
-                    if (!e.running) this._forgetId(e.name);
+                    if (!e.running) this._forgetId(e.id);
                 }
-                this._applyRoles();
-                this._syncOverflow();
-                this._refillLater(subMenu, "#showall");
+                this._placeAll();
             });
-            subMenu.addMenuItem(forgetAll);
         }
 
-        let hideAll = new ActionItem("Hide all in overflow");
-        hideAll.connect("activate", () => {
+        addAction(_("Hide all in overflow"), "#hideall", () => {
             let hiddenList = this._getList("hidden-list");
-            let shownList = this._getList("shown-list");
             for (let e of entries) {
-                if (!hiddenList.includes(e.name)) hiddenList.push(e.name);
+                if (!hiddenList.includes(e.id)) hiddenList.push(e.id);
             }
-            shownList = shownList.filter(n => !hiddenList.includes(n));
             this.settings.setValue("hidden-list", hiddenList);
-            this.settings.setValue("shown-list", shownList);
-            this._applyRoles();
-            this._syncOverflow();
-            this._refillLater(subMenu, "#hideall");
+            this.settings.setValue("shown-list", this._getList("shown-list").filter(n => !hiddenList.includes(n)));
+            this._placeAll();
         });
-        subMenu.addMenuItem(hideAll);
-        items["#hideall"] = hideAll;
 
         if (focusKey && items[focusKey]) items[focusKey].actor.grab_key_focus();
+    }
+
+    /* ---------- lifecycle ---------- */
+
+    on_orientation_changed(orientation) {
+        this.orientation = orientation;
+        let vertical = orientation == St.Side.LEFT || orientation == St.Side.RIGHT;
+        this.manager_container.vertical = vertical;
+        this.manager_container.style = vertical ? VERTICAL_STYLE : HORIZONTAL_STYLE;
+        if (this.menu.setOrientation) this.menu.setOrientation(orientation);
+        this._refreshIcons();
+    }
+
+    on_applet_removed_from_panel() {
+        this._removed = true;
+        this._cancelHoverOpen();
+        this._stopLeaveWatch();
+        this._endHandOff();
+        this.signals.disconnectAllSignals();
+
+        for (let id of [this._resolveId, this._layoutId, this._scaleId]) {
+            if (id) Mainloop.source_remove(id);
+        }
+        this._resolveId = this._layoutId = this._scaleId = 0;
+        if (this._refillIds) {
+            for (let id of this._refillIds.values()) Mainloop.source_remove(id);
+            this._refillIds.clear();
+        }
+        for (let id of Object.keys(this._attnTimers)) this._cancelAttnTimer(id);
+
+        for (let entry of Object.values(this.entries)) this._destroyEntry(entry);
+        this.entries = {};
+
+        if (this._recorder) {
+            this._recorder.destroy();
+            this._recorder = null;
+        }
+        this._chevronTooltip.destroy();
+        this.monitor = null;
+        this.settings.finalize();
     }
 }
 
