@@ -71,6 +71,7 @@ To update, pull or download the new version and run `./install.sh` again; the ap
 | Wait before moving an icon into the panel | 0.5 s |
 | Wait before moving it back to the overflow | 3 s |
 | Icons per row / icon size in the popup | 5 / 22 px |
+| Show "Icons shown in the panel" in the popup (always in the right-click menu) | on |
 | Write details to the log | off |
 | Show all icons in the panel again | button |
 

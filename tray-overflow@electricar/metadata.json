@@ -2,7 +2,7 @@
     "uuid": "tray-overflow@electricar",
     "name": "Tray Overflow",
     "description": "A system tray with a Windows-style ^ overflow: choose per app which tray icons stay in the panel and which go into a popup. Replaces the XApp Status Applet.",
-    "version": "2.0",
+    "version": "2.1",
     "author": "electricar",
     "max-instances": 1
 }

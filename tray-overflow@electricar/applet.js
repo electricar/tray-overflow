@@ -721,6 +721,7 @@ class TrayOverflowApplet extends Applet.Applet {
         this.settings.bind("open-on-hover", "openOnHover", () => this._onOpenOnHoverChanged());
         this.settings.bind("hover-delay", "hoverDelay", null);
         this.settings.bind("close-delay", "closeDelay", null);
+        this.settings.bind("show-list-in-popup", "showListInPopup", () => this._updatePopupList());
 
         this._appNames = new AppNames();
         this.entries = {};          // proxy key -> entry
@@ -1584,7 +1585,8 @@ class TrayOverflowApplet extends Applet.Applet {
         this.emptyItem = new PopupMenu.PopupMenuItem(_("No hidden icons"), { reactive: false });
         this.menu.addMenuItem(this.emptyItem);
 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this.listSeparator = new PopupMenu.PopupSeparatorMenuItem();
+        this.menu.addMenuItem(this.listSeparator);
 
         this.manageItem = new PopupMenu.PopupSubMenuMenuItem(_("Icons shown in the panel"));
         this.menu.addMenuItem(this.manageItem);
@@ -1596,7 +1598,7 @@ class TrayOverflowApplet extends Applet.Applet {
             }
             if (this.openOnHover) this._startLeaveWatch();
             this.noticeItem.actor.visible = this._stockTrayRunning();
-            this._fillManageMenu(this.manageItem.menu);
+            if (this.showListInPopup !== false) this._fillManageMenu(this.manageItem.menu);
         });
 
         this.ctxManageItem = new PopupMenu.PopupSubMenuMenuItem(_("Icons shown in the panel"));
@@ -1607,6 +1609,15 @@ class TrayOverflowApplet extends Applet.Applet {
         });
 
         this._layoutGrid();
+        this._updatePopupList();
+    }
+
+    // The icon list in the popup is optional; the right-click menu always has it.
+    _updatePopupList() {
+        let show = this.showListInPopup !== false;
+        if (!show && this.manageItem.menu.isOpen) this.manageItem.menu.close(false);
+        this.manageItem.actor.visible = show;
+        this.listSeparator.actor.visible = show;
     }
 
     _stockTrayRunning() {

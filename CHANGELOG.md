@@ -1,5 +1,8 @@
 # Changelog
 
+## 2.1 — 2026-11-24
+- Option to hide "Icons shown in the panel" from the popup, so it only shows the hidden icons; the list stays in the right-click menu (#3).
+
 ## 2.0 — 2026-11-23
 - **Tray Overflow is now a complete tray and replaces the XApp Status Applet.** It shows the visible icons in the panel and the hidden ones in the popup, so it no longer has to work around another applet. Remove the XApp Status Applet from the panel after updating.
 - Icons only appear once it's clear which app they belong to: no flicker at login.

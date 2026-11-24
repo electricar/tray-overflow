@@ -112,6 +112,12 @@
         "units": "px",
         "description": "Icon size"
     },
+    "show-list-in-popup": {
+        "type": "switch",
+        "default": true,
+        "description": "Show \"Icons shown in the panel\" in the popup",
+        "tooltip": "When off, the popup only shows the hidden icons. The list is always available by right-clicking the button."
+    },
     "head-troubleshooting": {
         "type": "header",
         "description": "Troubleshooting"
